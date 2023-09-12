@@ -1,4 +1,4 @@
-import { useEffect, useRef } from "react";
+import { useEffect, useRef, useState } from "react";
 import styled from "styled-components";
 
 const Screen = styled.div`
@@ -7,28 +7,13 @@ const Screen = styled.div`
   background-color: #000;
   position: relative;
   overflow: hidden;
+  overscroll-behavior: none;
 `;
 
-const Moon = styled.div`
-  width: 1rem;
-  height: 1rem;
-  border-radius: 50%;
-  width: 100vw;
-  height: 100vh;
-`;
+const scale = 2.6294577802732605e-9;
+const timeScale = 60 * 60 * 24 * 30;
 
-const Earth = styled.div`
-  width: 1rem;
-  height: 1rem;
-  border-radius: 50%;
-  width: 100vw;
-  height: 100vh;
-`;
-
-const scale = 0.0000016;
-const timeScale = 60 * 60 * 8;
-
-const fps = 50;
+const fps = 100;
 
 const G = 6.67430 * Math.pow(10, -11)
 
@@ -56,12 +41,12 @@ interface Planet {
 
 const objects: Planet[] = [
   {
-    name: 'Earth',
-    color: '#58f',
+    name: 'Sun',
+    color: '#fca',
 
     params: {
-      radius: 6378100,
-      mass: 5.9742 * Math.pow(10, 24),
+      radius: 695500000,
+      mass: 1.989e30,
     },
 
     speed: {
@@ -77,8 +62,71 @@ const objects: Planet[] = [
     }
   },
   {
+    name: 'Mercury',
+    color: '#a85',
+
+    params: {
+      radius: 2439700,
+      mass: 3.285e23,
+    },
+
+    speed: {
+      x: 56000,
+      y: 0,
+      z: 0
+    },
+
+    position: {
+      x: 0,
+      y: 45910000000,
+      z: 0
+    }
+  },
+  {
+    name: 'Venus',
+    color: '#fb7',
+
+    params: {
+      radius: 6051800,
+      mass: 4.87e24,
+    },
+
+    speed: {
+      x: 35000,
+      y: 0,
+      z: 0
+    },
+
+    position: {
+      x: 0,
+      y: 108000000000,
+      z: 0
+    }
+  },
+  {
+    name: 'Earth',
+    color: '#adf',
+
+    params: {
+      radius: 6378100,
+      mass: 5.9742 * Math.pow(10, 24),
+    },
+
+    speed: {
+      x: 30000,
+      y: 0,
+      z: 0
+    },
+
+    position: {
+      x: 0,
+      y: 149597870700,
+      z: 0
+    }
+  },
+  {
     name: 'Moon',
-    color: '#ccc',
+    color: '#888',
 
     params: {
       radius: 1737100,
@@ -87,12 +135,12 @@ const objects: Planet[] = [
 
     position: {
       x: - 3.84 * Math.pow(10, 8),
-      y: 0,
+      y: 149597870700,
       z: 0
     },
 
     speed: {
-      x: 0,
+      x: 30000,
       y: -1020, // m per sec
       z: 0
     }
@@ -121,8 +169,8 @@ class PlanetObject {
     this.node.style.top = offset.y + "px";
     this.node.style.left = offset.x + "px";
 
-    this.node.style.width = width * scale + 'px';
-    this.node.style.height = width * scale + 'px';
+    this.node.style.width = Math.max(2, width * scale) + 'px';
+    this.node.style.height = Math.max(2, width * scale) + 'px';
     
     this.node.style.transform = `translate3d(${x * scale}px, ${y * scale}px, ${z * scale}px)`;
   }
@@ -139,12 +187,49 @@ class PlanetObject {
 }
 
 function App() {
+  const flow = useRef<string>();
+  const date = useRef<number>(0);
   const ref = useRef<HTMLDivElement>(null);
+  const dateRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
     if (!ref.current) {
       return;
     }
+
+    // var img = document.getElementById("your-image");
+    // create and customize the canvas
+    var canvas = document.createElement("canvas");
+    const ctx = canvas.getContext("2d");
+
+    if (!ctx) {
+      return;
+    }
+
+    canvas.width = 2000;
+    canvas.height = 2000;
+
+    for (var i = 0; i < 20; i ++) {
+      ctx.strokeStyle = `rgba(255, 255, 255, ${i % 10 ? 0.2 : 0.5})`;
+      ctx.beginPath();
+      ctx.moveTo(0, i * 100);
+      ctx.lineTo(2000, i * 100);
+      ctx.lineWidth = 1;
+      ctx.stroke();
+
+      ctx.strokeStyle = `rgba(255, 255, 255, ${i % 10 ? 0.2 : 0.5})`;
+      ctx.beginPath();
+      ctx.moveTo(i * 100, 0);
+      ctx.lineTo(i * 100, 2000);
+      ctx.lineWidth = 1;
+      ctx.stroke();
+    }
+
+    const pngUrl = canvas.toDataURL();
+
+    ref.current.style.backgroundImage = `url(${pngUrl})`;
+
+
 
     let currentScale = scale;
 
@@ -154,6 +239,8 @@ function App() {
       x: 0,
       y: 0
     };
+
+
 
     objects.forEach(i => {
       const node = new PlanetObject(i.name, i.color, i.params, i.position, i.speed);
@@ -170,10 +257,13 @@ function App() {
     }
 
     const setScale = (e: Event & Partial<WheelEvent>) => {
-      const multiplier = e.deltaY ? e.deltaY < 1 ? - e.deltaY / 100 : 1 / (e.deltaY / 100) : 1;
+      const multiplier = e.deltaY ? e.deltaY < 1 ? 0.96 : 1.04 : 1;
 
       currentScale = currentScale * multiplier;
-      console.log(currentScale)
+
+      offset.x = offset.x * multiplier;
+      offset.y = offset.y * multiplier;
+      // console.log(currentScale)
     }
 
     const stopDrag = () => {
@@ -189,11 +279,18 @@ function App() {
     ref.current.addEventListener('mousewheel', setScale);
     ref.current.addEventListener('mousedown', startDrag);
 
-    const interval = setInterval(() => {
-      nodes.forEach(i => {
-        const gOffset = ({ x: 0, y: 0, z: 0 });
-        // i.affect({ x: 400, y: -80, z: 0 });
+    const startDate = new Date().valueOf();
 
+    const interval = setInterval(() => {
+      date.current += 1000 * timeScale / fps;
+      dateRef.current!.innerHTML = new Date(startDate + date.current).toLocaleString()
+      ref.current!.style.backgroundPosition = `calc(50% + ${offset.x}px) calc(50% + ${offset.y}px)`;
+
+      // scale bg
+      const zeroScale = Math.pow(10, Math.floor(Math.log10(currentScale)));
+      ref.current!.style.backgroundSize = currentScale / zeroScale * 35 + '%';
+
+      nodes.forEach(i => {
         nodes.forEach(j => {
           if (j === i) {
             return;
@@ -208,11 +305,11 @@ function App() {
 
           const absoluteDistance = Math.sqrt(Math.pow(distance.x, 2) + Math.pow(distance.y, 2) + Math.pow(distance.z, 2));
           
-          const deltaV = G * j.params.mass / Math.pow(absoluteDistance, 2) * (timeScale / fps) / 8;
+          const deltaV = G * j.params.mass / Math.pow(absoluteDistance, 2) * (timeScale / fps);
 
           const deltaSpeed: Coords = {
-            x: deltaV * (distance.x * 10 / absoluteDistance),
-            y: deltaV * (distance.y * 10 / absoluteDistance),
+            x: deltaV * (distance.x / absoluteDistance),
+            y: deltaV * (distance.y / absoluteDistance),
             z: 0,
           }
 
@@ -221,9 +318,13 @@ function App() {
       });
 
       nodes.forEach(i => {
-        console.log(i);
         i.affect(timeScale / fps);
         i.draw(currentScale, { x: ref.current!.clientWidth / 2 + offset.x, y: ref.current!.clientHeight / 2 + offset.y, z: 0 });
+        // console.log(flow);
+        if (flow.current === i.name) {
+          offset.x = - i.position.x * currentScale;
+          offset.y = - i.position.y * currentScale;
+        }
       });
     }, 1000 / fps);
 
@@ -234,8 +335,24 @@ function App() {
     }
   }, []);
 
+  useEffect(() => {
+
+  }, [dateRef]);
+
   return (
-    <Screen ref={ref} />
+    <Screen ref={ref}>
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+        <select value={flow.current} onChange={e => flow.current = e.target.value}>
+          <option />
+
+          {objects.map(i => (
+            <option value={i.name}>{i.name}</option>
+          ))}
+        </select>
+
+        <span style={{ color: "#fff", fontSize: "12px", fontFamily: "monospace" }} ref={dateRef} />
+      </div>
+    </Screen>
   );
 }
 
