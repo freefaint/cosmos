@@ -1,0 +1,29 @@
+{
+  "name": "utils",
+
+  "hosts": {
+    "freefaint.ru": {
+      "hostname": "freefaint.ru",
+      "username": "root"
+    }
+  },
+
+  "profiles": {
+    "utils": {
+      "path": "./build",
+      "host": "freefaint.ru",
+      "dir": "/var/www/voice/build",
+
+      "build": ["npm run build"],
+      "deploy": [],
+      "start": []
+    }
+  },
+
+  "scripts": {
+    "build": [
+      "remoting build utils",
+      "remoting deploy utils"
+    ]
+  }
+}
