@@ -9,7 +9,7 @@
   },
 
   "profiles": {
-    "utils": {
+    "cosmos": {
       "path": "./build",
       "host": "freefaint.ru",
       "dir": "/var/www/voice/build",
@@ -21,9 +21,14 @@
   },
 
   "scripts": {
-    "build": [
-      "remoting build utils",
-      "remoting deploy utils"
+    "cosmos": [
+      "remoting build cosmos",
+      "remoting deploy cosmos"
+    ],
+
+    "nginx": [
+      "remoting cp freefaint.ru ./nginx/cosmos.conf /etc/nginx/conf.d/cosmos.conf",
+      "remoting exec freefaint.ru systemctl restart nginx"
     ]
   }
 }
