@@ -12,7 +12,7 @@
     "cosmos": {
       "path": "./build",
       "host": "freefaint.ru",
-      "dir": "/var/www/voice/build",
+      "dir": "/var/www/cosmos",
 
       "build": ["npm run build"],
       "deploy": [],
