@@ -69,7 +69,7 @@
     </label>
     <label>
       Гравитация (k · g)
-      <input type="range" id="gravity" min="0" max="200" value="100" />
+      <input type="range" id="gravity" min="0" max="200" value="80" />
     </label>
     <label>
       Упругость пола
@@ -130,6 +130,9 @@
     const PLAYER_INDEX = 0;
 
     const dingAudio = document.getElementById('ding');
+    const sndTmp = dingAudio.cloneNode();
+    sndTmp.volume = 0.1;
+    sndTmp.play().catch(() => {});
     const canvas = document.getElementById('glcanvas');
     const gl = canvas.getContext('webgl');
     if (!gl) {
@@ -342,8 +345,8 @@
     playerSphere.pos.y = -1.0 + playerSphere.radius + 0.3;
     // чёрный глянец
     playerSphere.color = { r: 0.0, g: 0.0, b: 0.0 };
-    playerSphere.reflectivity = 1.0;
-    playerSphere.roughness = 0.9;
+    playerSphere.reflectivity = 0.1;
+    playerSphere.roughness = 0;
 
     const groundY = -1.0;
 
@@ -983,6 +986,38 @@
 
         const bottom = s.pos.y - s.radius;
         if (bottom < groundY) {
+          // ---- ЗВУК УДАРА О ПОЛ ----
+          // if (s.vel.y < 0) {
+          //   const relSpeed = Math.abs(s.vel.y); // насколько быстро врезались в пол
+          //   const energy = 0.5 * s.mass * relSpeed * relSpeed;
+
+          //   // нормализуем энергию в 0..1 (подбери число под свои скорости/массы)
+          //   let impact = energy / (energy + 80.0);
+
+          //   if (impact > 0.02) { // отсекаем совсем слабые шлепки
+          //     // точка удара — проекция шара на пол
+          //     const cx = s.pos.x;
+          //     const cy = groundY;
+          //     const cz = s.pos.z;
+
+          //     const dx = cx - viewCamPos.x;
+          //     const dy = cy - viewCamPos.y;
+          //     const dz = cz - viewCamPos.z;
+          //     const dist = Math.hypot(dx, dy, dz);
+
+          //     let vol = impact / (1 + dist * 0.4);
+          //     vol = Math.max(0, Math.min(1, vol));
+
+          //     if (vol > 0.01) {
+          //       console.log(vol)
+          //       const snd = dingAudio.cloneNode();
+          //       snd.volume = 1; // vol;
+          //       snd.play().catch(() => {});
+          //     }
+          //   }
+          // }
+          // ---- КОНЕЦ ЗВУКА О ПОЛ ----
+          
           s.pos.y = groundY + s.radius;
           if (s.vel.y < 0) {
             s.vel.y = -s.vel.y * floorBounceGlobal * s.restitution * objBounceGlobal;
@@ -1191,8 +1226,6 @@
         // не даём камере опуститься ниже пола
         const minCamY = groundY + 0.2;
         if (thirdPersonCam.y < minCamY) thirdPersonCam.y = minCamY;
-        
-        console.log(thirdPersonCam);
       }
 
       // целевая точка: либо firstPersonCam, либо thirdPersonCam
