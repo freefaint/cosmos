@@ -1,0 +1,759 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8" />
+  <title>Минимальный WebGL Ray Tracing + DOF Walk</title>
+  <style>
+    body {
+      margin: 0;
+      background: #000;
+      display: flex;
+      flex-direction: column;
+      justify-content: center;
+      align-items: center;
+      height: 100vh;
+      font-family: sans-serif;
+      color: #fff;
+    }
+    canvas {
+      border-radius: 10px;
+      max-width: 100%;
+      height: auto;
+    }
+    #controls {
+      margin-top: 12px;
+      background: rgba(10,10,10,0.8);
+      padding: 10px 14px;
+      border-radius: 10px;
+      display: flex;
+      gap: 16px;
+      font-size: 12px;
+      align-items: center;
+    }
+    #controls label {
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+      white-space: nowrap;
+    }
+    #controls input[type="range"] {
+      width: 160px;
+    }
+    #controls .inline {
+      flex-direction: row;
+      align-items: center;
+      gap: 6px;
+    }
+  </style>
+</head>
+<body>
+  <canvas id="glcanvas" width="900" height="500"></canvas>
+
+  <div id="controls">
+    <label>
+      Фокусное расстояние (FOV)
+      <input type="range" id="fov" min="25" max="100" value="60" />
+    </label>
+    <label>
+      Размер диафрагмы (апертура)
+      <input type="range" id="aperture" min="0" max="100" value="15" />
+    </label>
+    <label>
+      Дистанция фокуса (auto, disabled)
+      <input type="range" id="focusDist" min="2" max="15" value="6" disabled />
+    </label>
+    <label class="inline">
+      <input type="checkbox" id="crosshair" checked />
+      Показывать маркер
+    </label>
+  </div>
+
+  <script>
+    const canvas = document.getElementById('glcanvas');
+    const gl = canvas.getContext('webgl');
+    if (!gl) {
+      alert('WebGL не завезли. Браузер – мусорное ведро.');
+    }
+
+    // Слайдеры
+    const fovSlider = document.getElementById('fov');
+    const apertureSlider = document.getElementById('aperture');
+    const focusSlider = document.getElementById('focusDist'); // отключён
+    const crosshairCheckbox = document.getElementById('crosshair');
+
+    let fov = parseFloat(fovSlider.value);           // градусы
+    let aperture = (parseFloat(apertureSlider.value) / 100) * 0.4; // 0..0.4
+    let showCrosshair = crosshairCheckbox.checked;
+
+    fovSlider.addEventListener('input', () => {
+      fov = parseFloat(fovSlider.value);
+    });
+    apertureSlider.addEventListener('input', () => {
+      aperture = (parseFloat(apertureSlider.value) / 100) * 0.4;
+    });
+    crosshairCheckbox.addEventListener('change', () => {
+      showCrosshair = crosshairCheckbox.checked;
+    });
+
+    // ====== Управление камерой (бродилка) ======
+    const keys = {};
+    window.addEventListener('keydown', (e) => {
+      keys[e.code] = true;
+    });
+    window.addEventListener('keyup', (e) => {
+      keys[e.code] = false;
+    });
+
+    // Позиция и ориентация камеры
+    let camPos = { x: 0, y: 0.3, z: 5.0 };
+    let camYaw = 180;   // в градусах
+    let camPitch = -5;  // в градусах
+
+    // Линейная скорость камеры (по плоскости XZ)
+    let velX = 0;
+    let velZ = 0;
+
+    // Угловые скорости для плавного поворота
+    let yawVel = 0;
+    let pitchVel = 0;
+
+    let lastTimeMs = 0;
+
+    let currentFocusDist = 6;
+    let focusInitialized = false;
+
+    // Мышь для поворота
+    let mouseDown = false;
+    let lastMouseX = 0;
+    let lastMouseY = 0;
+
+    canvas.addEventListener('mousedown', (e) => {
+      mouseDown = true;
+      lastMouseX = e.clientX;
+      lastMouseY = e.clientY;
+    });
+    window.addEventListener('mouseup', () => {
+      mouseDown = false;
+    });
+    window.addEventListener('mousemove', (e) => {
+      if (!mouseDown) return;
+      const dx = e.clientX - lastMouseX;
+      const dy = e.clientY - lastMouseY;
+      lastMouseX = e.clientX;
+      lastMouseY = e.clientY;
+      const sens = 0.15; // чувствительность мыши
+      camYaw += dx * sens;
+      camPitch -= dy * sens;
+      if (camPitch > 89) camPitch = 89;
+      if (camPitch < -89) camPitch = -89;
+    });
+
+    // Вершинный шейдер
+    const vsSource = `
+      attribute vec2 aPosition;
+      void main() {
+        gl_Position = vec4(aPosition, 0.0, 1.0);
+      }
+    `;
+
+    // Фрагментный шейдер
+    const fsSource = `
+      precision highp float;
+
+      uniform vec2 uResolution;
+      uniform float uTime;
+      uniform float uFov;        // градусы
+      uniform float uAperture;   // размер диафрагмы
+      uniform float uFocusDist;  // дистанция фокуса
+      uniform float uShowCrosshair;
+
+      uniform vec3 uCamPos;
+      uniform float uCamYaw;
+      uniform float uCamPitch;
+
+      float intersectSphere(vec3 ro, vec3 rd, vec3 center, float radius) {
+        vec3 oc = ro - center;
+        float a = dot(rd, rd);
+        float b = 2.0 * dot(oc, rd);
+        float c = dot(oc, oc) - radius * radius;
+        float disc = b*b - 4.0*a*c;
+        if (disc < 0.0) return -1.0;
+        float s = sqrt(disc);
+        float t1 = (-b - s) / (2.0 * a);
+        float t2 = (-b + s) / (2.0 * a);
+        float t = t1;
+        if (t < 0.0) t = t2;
+        if (t < 0.0) return -1.0;
+        return t;
+      }
+
+      float intersectPlane(vec3 ro, vec3 rd, vec3 n, float d) {
+        float denom = dot(rd, n);
+        if (abs(denom) < 1e-4) return -1.0;
+        float t = -(dot(ro, n) + d) / denom;
+        return t > 0.0 ? t : -1.0;
+      }
+
+      struct Hit {
+        float t;
+        vec3 normal;
+        vec3 color;
+        float reflectivity;
+        float roughness;
+      };
+
+      vec3 getSkyColor(vec3 rd) {
+        float t = 0.5 * (rd.y + 1.0);
+        return mix(vec3(0.05, 0.05, 0.08), vec3(0.2, 0.4, 0.7), t);
+      }
+
+      float hash(vec2 p) {
+        return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453123);
+      }
+
+      Hit traceScene(vec3 ro, vec3 rd) {
+        Hit hit;
+        hit.t = -1.0;
+        hit.normal = vec3(0.0);
+        hit.color = vec3(0.0);
+        hit.reflectivity = 0.0;
+        hit.roughness = 0.0;
+
+        // --- Сфера 1 ---
+        vec3 sphereCenter1 = vec3(0.0, 0.0, -4.0);
+        float sphereRadius1 = 1.0;
+        float tSphere1 = intersectSphere(ro, rd, sphereCenter1, sphereRadius1);
+        if (tSphere1 > 0.0) {
+          hit.t = tSphere1;
+          vec3 pos = ro + rd * tSphere1;
+          hit.normal = normalize(pos - sphereCenter1);
+          hit.color = vec3(0.9, 0.4, 0.2);
+          hit.reflectivity = 0.3;
+          hit.roughness   = 0.18;
+        }
+
+        // --- Сфера 2 ---
+        vec3 sphereCenter2 = vec3(1.8, -0.2, -3.0);
+        float sphereRadius2 = 0.6;
+        float tSphere2 = intersectSphere(ro, rd, sphereCenter2, sphereRadius2);
+        if (tSphere2 > 0.0 && (hit.t < 0.0 || tSphere2 < hit.t)) {
+          hit.t = tSphere2;
+          vec3 pos = ro + rd * tSphere2;
+          hit.normal = normalize(pos - sphereCenter2);
+          hit.color = vec3(0.2, 0.7, 1.0);
+          hit.reflectivity = 0.9;
+          hit.roughness   = 0.2;
+        }
+
+        // --- Плоскость (пол) ---
+        vec3 planeN = vec3(0.0, 1.0, 0.0);
+        float planeD = 1.0;
+        float tPlane = intersectPlane(ro, rd, planeN, planeD);
+        if (tPlane > 0.0) {
+          vec3 pos = ro + rd * tPlane;
+          if (hit.t < 0.0 || tPlane < hit.t) {
+            hit.t = tPlane;
+            hit.normal = planeN;
+
+            float scale = 1.5;
+            float cx = floor(pos.x * scale);
+            float cz = floor(pos.z * scale);
+            float checker = mod(cx + cz, 2.0);
+            float cellColor = mix(0.2, 0.9, checker);
+
+            float dist = length(pos.xz);
+            float fadeStart = 8.0;
+            float fadeEnd   = 25.0;
+            float fade = clamp((dist - fadeStart) / (fadeEnd - fadeStart), 0.0, 1.0);
+            float avgColor = 0.55;
+            float filtered = mix(cellColor, avgColor, fade);
+
+            hit.color = vec3(filtered * 0.9);
+            hit.reflectivity = 0.08;
+            hit.roughness   = 0.06;
+          }
+        }
+
+        return hit;
+      }
+
+      // мягкие тени от площадного источника света
+      float softShadow(vec3 pos, vec3 lightPos, float lightRadius) {
+        float visibility = 0.0;
+        const int SAMPLES = 8;
+
+        for (int i = 0; i < SAMPLES; i++) {
+          float fi = float(i);
+
+          // псевдослучайный сэмпл по диску источника
+          vec2 rnd = vec2(
+            hash(pos.xz + vec2(13.1, 7.7)  * fi + uTime * 0.3),
+            hash(pos.xz + vec2(5.3,  9.2)  * fi + uTime * 0.47)
+          );
+          float r = lightRadius * sqrt(rnd.x);
+          float a = rnd.y * 6.2831853;
+
+          // диск в плоскости XZ (свет как потолочный круглый плафон)
+          vec3 lp = lightPos + vec3(cos(a) * r, 0.0, sin(a) * r);
+
+          vec3 L = lp - pos;
+          float distToLight = length(L);
+          vec3 dir = L / distToLight;
+
+          vec3 ro = pos + dir * 0.02;
+          vec3 rd = dir;
+
+          // пересечения с геометрией до источника
+          float tMin = 1e20;
+
+          vec3 sphereCenter1 = vec3(0.0, 0.0, -4.0);
+          float sphereRadius1 = 1.0;
+          float tS1 = intersectSphere(ro, rd, sphereCenter1, sphereRadius1);
+          if (tS1 > 0.0 && tS1 < distToLight) tMin = min(tMin, tS1);
+
+          vec3 sphereCenter2 = vec3(1.8, -0.2, -3.0);
+          float sphereRadius2 = 0.6;
+          float tS2 = intersectSphere(ro, rd, sphereCenter2, sphereRadius2);
+          if (tS2 > 0.0 && tS2 < distToLight) tMin = min(tMin, tS2);
+
+          vec3 planeN = vec3(0.0, 1.0, 0.0);
+          float planeD = 1.0;
+          float tP = intersectPlane(ro, rd, planeN, planeD);
+          if (tP > 0.0 && tP < distToLight) tMin = min(tMin, tP);
+
+          // если до источника ничего не встретили — свет виден
+          if (tMin >= 1e19) {
+            visibility += 1.0;
+          }
+        }
+
+        return visibility / float(SAMPLES);
+      }
+
+      vec3 shadeHit(vec3 ro, vec3 rd, Hit hit) {
+        vec3 pos = ro + rd * hit.t;
+
+        // Параметры источника света (позиция и размер)
+        vec3 lightPos = vec3(-2.0, 4.0, -1.5); // можно подвигать, чтобы тени были красивее
+        float lightRadius = 1.2;
+
+        vec3 L = lightPos - pos;
+        float distToLight = length(L);
+        vec3 lightDir = L / distToLight;
+
+        float diff = max(dot(hit.normal, lightDir), 0.0);
+
+        // затухание с расстоянием
+        float att = 1.0 / (1.0 + 0.1 * distToLight + 0.02 * distToLight * distToLight);
+
+        float shadow = softShadow(pos, lightPos, lightRadius); // 0..1, где 0 = полная тень
+        float ambient = 0.18;
+
+        float lighting = ambient + diff * shadow * 1.4 * att;
+
+        float skyRef = max(0.0, dot(hit.normal, vec3(0.0, 1.0, 0.0)));
+        vec3 skyColor = vec3(0.3, 0.5, 0.8) * skyRef * 0.2;
+
+        return hit.color * lighting + skyColor;
+      }
+
+      vec3 blurredReflection(vec3 origin, vec3 reflDir, Hit baseHit, vec2 uv) {
+        vec3 n = baseHit.normal;
+        float rough = baseHit.roughness;
+
+        vec3 t = normalize(abs(reflDir.y) < 0.99 ? cross(reflDir, vec3(0.0,1.0,0.0))
+                                                : cross(reflDir, vec3(1.0,0.0,0.0)));
+        vec3 b = cross(reflDir, t);
+
+        vec3 acc = vec3(0.0);
+        const int SAMPLE_COUNT = 4;
+
+        for (int i = 0; i < SAMPLE_COUNT; i++) {
+          float fi = float(i);
+          float r1 = hash(uv + vec2(fi * 13.1, fi * 7.7) + uTime * 0.1);
+          float r2 = hash(uv + vec2(fi * 5.3,  fi * 9.2) + uTime * 0.13);
+
+          float angle = r1 * 6.2831853;
+          float radius = r2 * rough;
+
+          vec3 offsetDir = normalize(
+            reflDir +
+            (cos(angle) * t + sin(angle) * b) * radius
+          );
+
+          Hit h = traceScene(origin, offsetDir);
+          vec3 col;
+          if (h.t < 0.0) {
+            col = getSkyColor(offsetDir);
+          } else {
+            col = shadeHit(origin, offsetDir, h);
+          }
+
+          acc += col;
+        }
+
+        return acc / float(SAMPLE_COUNT);
+      }
+
+      vec3 renderRay(vec2 uv) {
+        vec3 camBasePos = uCamPos;
+
+        float yawRad   = radians(uCamYaw);
+        float pitchRad = radians(uCamPitch);
+
+        vec3 forward = normalize(vec3(
+          cos(pitchRad) * sin(yawRad),
+          sin(pitchRad),
+          cos(pitchRad) * cos(yawRad)
+        ));
+
+        vec3 right = normalize(vec3(forward.z, 0.0, -forward.x));
+        vec3 up    = normalize(cross(right, forward));
+
+        // FOV
+        float fovRad = radians(uFov);
+        float fovScale = tan(fovRad * 0.5);
+        vec3 rdIdeal = normalize(forward + uv.x * fovScale * right + uv.y * fovScale * up);
+
+        // DOF: шумная линза (боке с зерном)
+        vec2 rnd = vec2(
+          hash(uv + vec2(uTime, 1.23)),
+          hash(uv + vec2(4.56, uTime))
+        );
+        float r = sqrt(rnd.x);
+        float theta = rnd.y * 6.2831853;
+        vec2 disk = r * vec2(cos(theta), sin(theta));
+        float lensRadius = uAperture * 0.5;
+        vec3 lensOffset = (right * disk.x + up * disk.y) * lensRadius;
+
+        vec3 camPos = camBasePos + lensOffset;
+
+        vec3 focusPoint = camBasePos + rdIdeal * uFocusDist;
+        vec3 rd = normalize(focusPoint - camPos);
+
+        Hit hit1 = traceScene(camPos, rd);
+
+        vec3 color;
+
+        if (hit1.t < 0.0) {
+          color = getSkyColor(rd);
+        } else {
+          vec3 baseColor = shadeHit(camPos, rd, hit1);
+
+          if (hit1.reflectivity > 0.01) {
+            vec3 reflDir = reflect(rd, hit1.normal);
+            vec3 reflOrigin = camPos + rd * hit1.t + hit1.normal * 0.01;
+
+            vec3 reflColor;
+            if (hit1.roughness < 0.005) {
+              Hit h2 = traceScene(reflOrigin, reflDir);
+              if (h2.t < 0.0) reflColor = getSkyColor(reflDir);
+              else            reflColor = shadeHit(reflOrigin, reflDir, h2);
+            } else {
+              reflColor = blurredReflection(reflOrigin, reflDir, hit1, uv);
+            }
+
+            float cosTheta = clamp(dot(-rd, hit1.normal), 0.0, 1.0);
+            float F0 = hit1.reflectivity;
+            float fresnel = F0 + (1.0 - F0) * pow(1.0 - cosTheta, 5.0);
+
+            float dim = 0.7;
+            float mixFactor = fresnel * dim;
+
+            color = mix(baseColor, reflColor, mixFactor);
+          } else {
+            color = baseColor;
+          }
+        }
+
+        color = pow(color, vec3(0.4545));
+        return color;
+      }
+
+      void main() {
+        vec2 baseUv = (gl_FragCoord.xy - 0.5 * uResolution) / uResolution.y;
+        baseUv.y = -baseUv.y;
+
+        vec2 offsets[4];
+        offsets[0] = vec2(-0.25, -0.25);
+        offsets[1] = vec2( 0.25, -0.25);
+        offsets[2] = vec2(-0.25,  0.25);
+        offsets[3] = vec2( 0.25,  0.25);
+
+        vec3 col = vec3(0.0);
+        for (int i = 0; i < 4; i++) {
+          vec2 uv = baseUv + offsets[i] / uResolution.y;
+          col += renderRay(uv);
+        }
+        col /= 4.0;
+
+        // Маркер прицела по центру (если включен)
+        float inner = 0.004;
+        float outer = 0.015;
+        float dist = length(baseUv);
+        float mask = 1.0 - smoothstep(inner, outer, dist);
+        vec3 chColor = vec3(1.0);
+        float chAlpha = 0.25;
+        col = mix(col, chColor, mask * chAlpha * uShowCrosshair);
+
+        gl_FragColor = vec4(col, 1.0);
+      }
+    `;
+
+    function createShader(gl, type, source) {
+      const shader = gl.createShader(type);
+      gl.shaderSource(shader, source);
+      gl.compileShader(shader);
+      if (!gl.getShaderParameter(shader, gl.COMPILE_STATUS)) {
+        console.error('Ошибка компиляции шейдера:', gl.getShaderInfoLog(shader));
+        gl.deleteShader(shader);
+        return null;
+      }
+      return shader;
+    }
+
+    function createProgram(gl, vsSource, fsSource) {
+      const vs = createShader(gl, gl.VERTEX_SHADER, vsSource);
+      const fs = createShader(gl, gl.FRAGMENT_SHADER, fsSource);
+      if (!vs || !fs) {
+        throw new Error('Не удалось скомпилировать шейдеры');
+      }
+      const program = gl.createProgram();
+      gl.attachShader(program, vs);
+      gl.attachShader(program, fs);
+      gl.linkProgram(program);
+      if (!gl.getProgramParameter(program, gl.LINK_STATUS)) {
+        console.error('Ошибка линковки программы:', gl.getProgramInfoLog(program));
+        gl.deleteProgram(program);
+        return null;
+      }
+      return program;
+    }
+
+    const program = createProgram(gl, vsSource, fsSource);
+    gl.useProgram(program);
+
+    const aPositionLoc   = gl.getAttribLocation(program, 'aPosition');
+    const uResolutionLoc = gl.getUniformLocation(program, 'uResolution');
+    const uTimeLoc       = gl.getUniformLocation(program, 'uTime');
+    const uFovLoc        = gl.getUniformLocation(program, 'uFov');
+    const uApertureLoc   = gl.getUniformLocation(program, 'uAperture');
+    const uFocusDistLoc  = gl.getUniformLocation(program, 'uFocusDist');
+    const uCamPosLoc     = gl.getUniformLocation(program, 'uCamPos');
+    const uCamYawLoc     = gl.getUniformLocation(program, 'uCamYaw');
+    const uCamPitchLoc   = gl.getUniformLocation(program, 'uCamPitch');
+    const uShowCrosshairLoc = gl.getUniformLocation(program, 'uShowCrosshair');
+
+    const vertices = new Float32Array([
+      -1, -1,
+       1, -1,
+      -1,  1,
+      -1,  1,
+       1, -1,
+       1,  1
+    ]);
+
+    const buffer = gl.createBuffer();
+    gl.bindBuffer(gl.ARRAY_BUFFER, buffer);
+    gl.bufferData(gl.ARRAY_BUFFER, vertices, gl.STATIC_DRAW);
+
+    gl.enableVertexAttribArray(aPositionLoc);
+    gl.vertexAttribPointer(aPositionLoc, 2, gl.FLOAT, false, 0, 0);
+
+    function resize() {
+      const ratio = canvas.width / canvas.height;
+      const w = Math.min(window.innerWidth * 0.95, 1000);
+      const h = w / ratio;
+      canvas.style.width = w + 'px';
+      canvas.style.height = h + 'px';
+      gl.viewport(0, 0, canvas.width, canvas.height);
+      gl.uniform2f(uResolutionLoc, canvas.width, canvas.height);
+    }
+    window.addEventListener('resize', resize);
+    resize();
+
+    // JS-вариант трассинга для автофокуса
+    function intersectSphereJS(ro, rd, center, radius) {
+      const ocx = ro.x - center.x;
+      const ocy = ro.y - center.y;
+      const ocz = ro.z - center.z;
+      const a = rd.x*rd.x + rd.y*rd.y + rd.z*rd.z;
+      const b = 2 * (ocx*rd.x + ocy*rd.y + ocz*rd.z);
+      const c = ocx*ocx + ocy*ocy + ocz*ocz - radius*radius;
+      const disc = b*b - 4*a*c;
+      if (disc < 0) return -1;
+      const s = Math.sqrt(disc);
+      let t1 = (-b - s) / (2*a);
+      let t2 = (-b + s) / (2*a);
+      let t = t1;
+      if (t < 0) t = t2;
+      if (t < 0) return -1;
+      return t;
+    }
+
+    function intersectPlaneJS(ro, rd, n, d) {
+      const denom = rd.x*n.x + rd.y*n.y + rd.z*n.z;
+      if (Math.abs(denom) < 1e-4) return -1;
+      const dotRoN = ro.x*n.x + ro.y*n.y + ro.z*n.z;
+      const t = -(dotRoN + d) / denom;
+      return t > 0 ? t : -1;
+    }
+
+    function render(timeMs) {
+      const time = timeMs * 0.001;
+      let dt = 0;
+      if (lastTimeMs) {
+        dt = (timeMs - lastTimeMs) * 0.001;
+      }
+      lastTimeMs = timeMs;
+
+      // ==== обновляем камеру ====
+      const yawRad = camYaw * Math.PI / 180;
+
+      // движение WASD
+      let dirX = 0;
+      let dirZ = 0;
+      if (keys['KeyW']) {
+        dirX += Math.sin(yawRad);
+        dirZ += Math.cos(yawRad);
+      }
+      if (keys['KeyS']) {
+        dirX -= Math.sin(yawRad);
+        dirZ -= Math.cos(yawRad);
+      }
+      if (keys['KeyA']) {
+        dirX += Math.sin(yawRad - Math.PI / 2);
+        dirZ += Math.cos(yawRad - Math.PI / 2);
+      }
+      if (keys['KeyD']) {
+        dirX += Math.sin(yawRad + Math.PI / 2);
+        dirZ += Math.cos(yawRad + Math.PI / 2);
+      }
+
+      const accel = 8.0;
+      const maxSpeed = 6.0;
+      const damping = 4.0;
+
+      const dirLen = Math.hypot(dirX, dirZ);
+      if (dirLen > 0.0001 && dt > 0) {
+        const nx = dirX / dirLen;
+        const nz = dirZ / dirLen;
+        velX += nx * accel * dt;
+        velZ += nz * accel * dt;
+      } else {
+        const speed = Math.hypot(velX, velZ);
+        if (speed > 0) {
+          const drop = Math.max(speed - damping * dt, 0) / speed;
+          velX *= drop;
+          velZ *= drop;
+        }
+      }
+
+      let speed = Math.hypot(velX, velZ);
+      if (speed > maxSpeed) {
+        const s = maxSpeed / speed;
+        velX *= s;
+        velZ *= s;
+      }
+
+      camPos.x += velX * dt;
+      camPos.z += velZ * dt;
+
+      // Плавный поворот стрелками
+      const rotAccel = 200.0;    // deg/s^2
+      const rotDamp  = 6.0;      // демпфирование
+      const maxRotSpeed = 140.0; // deg/s
+
+      let yawInput = 0;
+      if (keys['ArrowLeft'])  yawInput -= 1;
+      if (keys['ArrowRight']) yawInput += 1;
+
+      let pitchInput = 0;
+      if (keys['ArrowUp'])    pitchInput += 1;
+      if (keys['ArrowDown'])  pitchInput -= 1;
+
+      if (dt > 0) {
+        yawVel   += yawInput   * rotAccel * dt;
+        pitchVel += pitchInput * rotAccel * dt;
+
+        // демпфирование, если нет ввода
+        if (yawInput === 0)   yawVel   *= Math.max(0, 1 - rotDamp * dt);
+        if (pitchInput === 0) pitchVel *= Math.max(0, 1 - rotDamp * dt);
+
+        // ограничение
+        const yawSpeedMag = Math.abs(yawVel);
+        if (yawSpeedMag > maxRotSpeed) {
+          yawVel *= maxRotSpeed / yawSpeedMag;
+        }
+        const pitchSpeedMag = Math.abs(pitchVel);
+        if (pitchSpeedMag > maxRotSpeed) {
+          pitchVel *= maxRotSpeed / pitchSpeedMag;
+        }
+
+        camYaw   += yawVel * dt;
+        camPitch += pitchVel * dt;
+      }
+
+      if (camPitch > 89) camPitch = 89;
+      if (camPitch < -89) camPitch = -89;
+
+      // ==== автофокус по центральному лучу ====
+      const yawRadF   = camYaw * Math.PI / 180;
+      const pitchRadF = camPitch * Math.PI / 180;
+      const fwd = {
+        x: Math.cos(pitchRadF) * Math.sin(yawRadF),
+        y: Math.sin(pitchRadF),
+        z: Math.cos(pitchRadF) * Math.cos(yawRadF),
+      };
+      // нормализовать на всякий случай
+      const fLen = Math.hypot(fwd.x, fwd.y, fwd.z);
+      fwd.x /= fLen; fwd.y /= fLen; fwd.z /= fLen;
+
+      const ro = { ...camPos };
+      let tMin = Infinity;
+
+      const tS1 = intersectSphereJS(ro, fwd, {x:0,y:0,z:-4}, 1.0);
+      if (tS1 > 0 && tS1 < tMin) tMin = tS1;
+
+      const tS2 = intersectSphereJS(ro, fwd, {x:1.8,y:-0.2,z:-3}, 0.6);
+      if (tS2 > 0 && tS2 < tMin) tMin = tS2;
+
+      const tP = intersectPlaneJS(ro, fwd, {x:0,y:1,z:0}, 1.0); // y = -1
+      if (tP > 0 && tP < tMin) tMin = tP;
+
+      let focusDistAuto = isFinite(tMin) ? tMin : 10.0;
+      if (focusDistAuto < 0.5) focusDistAuto = 0.5;
+
+      // === плавный автофокус с одинаковой скоростью в обе стороны ===
+      if (!focusInitialized) {
+        currentFocusDist = focusDistAuto;
+        focusInitialized = true;
+      } else if (dt > 0) {
+        const tau = 0.25; // желаемое время подстройки в секундах
+        const alpha = 1 - Math.exp(-dt / tau);
+        currentFocusDist += (focusDistAuto - currentFocusDist) * alpha;
+      }
+
+      // ==== рендер ====
+      gl.viewport(0, 0, canvas.width, canvas.height);
+      gl.clearColor(0, 0, 0, 1);
+      gl.clear(gl.COLOR_BUFFER_BIT);
+
+      gl.uniform1f(uTimeLoc, time);
+      gl.uniform1f(uFovLoc, fov);
+      gl.uniform1f(uApertureLoc, aperture);
+      gl.uniform1f(uFocusDistLoc, currentFocusDist);
+      gl.uniform3f(uCamPosLoc, camPos.x, camPos.y, camPos.z);
+      gl.uniform1f(uCamYawLoc, camYaw);
+      gl.uniform1f(uCamPitchLoc, camPitch);
+      gl.uniform1f(uShowCrosshairLoc, showCrosshair ? 1.0 : 0.0);
+
+      gl.drawArrays(gl.TRIANGLES, 0, 6);
+
+      requestAnimationFrame(render);
+    }
+
+    requestAnimationFrame(render);
+  </script>
+</body>
+</html>

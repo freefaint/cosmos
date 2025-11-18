@@ -1,0 +1,1311 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8" />
+  <title>WebGL Ray Tracing + DOF + Physics Walk</title>
+  <style>
+    body {
+      margin: 0;
+      background: #000;
+      display: flex;
+      flex-direction: column;
+      justify-content: center;
+      align-items: center;
+      height: 100vh;
+      font-family: sans-serif;
+      color: #fff;
+    }
+    canvas {
+      border-radius: 10px;
+      max-width: 100%;
+      height: auto;
+    }
+    #controls {
+      margin-top: 12px;
+      background: rgba(10,10,10,0.8);
+      padding: 10px 14px;
+      border-radius: 10px;
+      display: flex;
+      gap: 16px;
+      font-size: 12px;
+      align-items: center;
+      flex-wrap: wrap;
+    }
+    #controls label {
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+      white-space: nowrap;
+    }
+    #controls input[type="range"] {
+      width: 160px;
+    }
+    #controls .inline {
+      flex-direction: row;
+      align-items: center;
+      gap: 6px;
+    }
+    #controls button {
+      padding: 4px 10px;
+      border-radius: 6px;
+      border: none;
+      cursor: pointer;
+      font-size: 12px;
+    }
+  </style>
+</head>
+<body>
+  <audio id="ding" src="dzin.mp3" preload="auto"></audio>
+  <canvas id="glcanvas" width="900" height="500"></canvas>
+
+  <div id="controls">
+    <label>
+      Фокусное расстояние (FOV)
+      <input type="range" id="fov" min="25" max="150" value="120" />
+    </label>
+    <label>
+      Размер диафрагмы (апертура)
+      <input type="range" id="aperture" min="0" max="100" value="15" />
+    </label>
+    <label>
+      Гравитация (k · g)
+      <input type="range" id="gravity" min="0" max="200" value="100" />
+    </label>
+    <label>
+      Упругость пола
+      <input type="range" id="floorBounce" min="0" max="100" value="60" />
+    </label>
+    <label>
+      Упругость объектов
+      <input type="range" id="objBounce" min="0" max="100" value="80" />
+    </label>
+
+    <label class="inline">
+      <input type="checkbox" id="crosshair" checked />
+      Прицел
+    </label>
+    <label class="inline">
+      <input type="checkbox" id="enableShadows" checked />
+      Тени
+    </label>
+    <label class="inline">
+      <input type="checkbox" id="enableSoftShadows" />
+      Умные тени
+    </label>
+    <label class="inline">
+      <input type="checkbox" id="enableReflections" checked />
+      Отражения
+    </label>
+    <label class="inline">
+      <input type="checkbox" id="enableSmartReflections" />
+      Умные отражения
+    </label>
+    <label class="inline">
+      <input type="checkbox" id="enableReflectionBlur" />
+      Размытие отражений
+    </label>
+    <label class="inline">
+      <input type="checkbox" id="enableReflectionShadows" checked />
+      Отражать тени
+    </label>
+    <label class="inline">
+      <input type="checkbox" id="enableDOF" checked />
+      Боке (DOF)
+    </label>
+
+    <button id="fullscreenBtn">Во весь экран</button>
+
+    <label class="inline">
+      <input type="checkbox" id="thirdPerson" checked />
+      Камера от 3 лица
+    </label>
+    <label class="inline">
+      <input type="checkbox" id="handheldCam" checked />
+      Дрожание камеры
+    </label>
+  </div>
+
+  <script>
+    const MAX_SPHERES = 32;
+    const PLAYER_INDEX = 0;
+
+    const dingAudio = document.getElementById('ding');
+    const canvas = document.getElementById('glcanvas');
+    const gl = canvas.getContext('webgl');
+    if (!gl) {
+      alert('WebGL не завезли. Браузер – мусорное ведро.');
+    }
+
+    // === fullscreen (как делал) ===
+    const fullscreenBtn = document.getElementById('fullscreenBtn');
+    fullscreenBtn.addEventListener('click', () => {
+      if (!document.fullscreenElement) {
+        if (canvas.requestFullscreen) {
+          canvas.requestFullscreen();
+        } else if (canvas.webkitRequestFullscreen) {
+          canvas.webkitRequestFullscreen();
+        }
+      } else {
+        if (document.exitFullscreen) {
+          document.exitFullscreen();
+        } else if (document.webkitExitFullscreen) {
+          document.webkitExitFullscreen();
+        }
+      }
+    });
+    document.addEventListener('fullscreenchange', () => {
+      fullscreenBtn.textContent = document.fullscreenElement
+        ? 'Выйти из полноэкранного'
+        : 'Во весь экран';
+    });
+
+    // ==== UI ====
+    const fovSlider = document.getElementById('fov');
+    const apertureSlider = document.getElementById('aperture');
+    const gravitySlider = document.getElementById('gravity');
+    const floorBounceSlider = document.getElementById('floorBounce');
+    const objBounceSlider = document.getElementById('objBounce');
+    const crosshairCheckbox = document.getElementById('crosshair');
+    const enableShadowsCheckbox = document.getElementById('enableShadows');
+    const enableSoftShadowsCheckbox = document.getElementById('enableSoftShadows');
+    const enableReflectionsCheckbox = document.getElementById('enableReflections');
+    const enableSmartReflectionsCheckbox = document.getElementById('enableSmartReflections');
+    const enableReflectionBlurCheckbox = document.getElementById('enableReflectionBlur');
+    const enableReflectionShadowsCheckbox = document.getElementById('enableReflectionShadows');
+    const enableDOFCheckbox = document.getElementById('enableDOF');
+    const thirdPersonCheckbox = document.getElementById('thirdPerson');
+    const handheldCheckbox = document.getElementById('handheldCam');
+
+    let fov = parseFloat(fovSlider.value);
+    let aperture = (parseFloat(apertureSlider.value) / 100) * 0.4;
+    let gravityK = parseFloat(gravitySlider.value) / 100;      // 0..2
+    let floorBounceGlobal = parseFloat(floorBounceSlider.value) / 100; // 0..1
+    let objBounceGlobal = parseFloat(objBounceSlider.value) / 100;     // 0..1
+
+    let showCrosshair = crosshairCheckbox.checked;
+    let enableHandheld = handheldCheckbox.checked;
+    let enableShadows = enableShadowsCheckbox.checked;
+    let enableSoftShadows = enableSoftShadowsCheckbox.checked;
+    let enableReflections = enableReflectionsCheckbox.checked;
+    let enableSmartReflections = enableSmartReflectionsCheckbox.checked;
+    let enableReflectionBlur = enableReflectionBlurCheckbox.checked;
+    let enableReflectionShadows = enableReflectionShadowsCheckbox.checked;
+    let enableDOF = enableDOFCheckbox.checked;
+    let thirdPerson = thirdPersonCheckbox.checked;
+
+    fovSlider.addEventListener('input', () => {
+      fov = parseFloat(fovSlider.value);
+    });
+    apertureSlider.addEventListener('input', () => {
+      aperture = (parseFloat(apertureSlider.value) / 100) * 0.4;
+    });
+    gravitySlider.addEventListener('input', () => {
+      gravityK = parseFloat(gravitySlider.value) / 100;
+    });
+    floorBounceSlider.addEventListener('input', () => {
+      floorBounceGlobal = parseFloat(floorBounceSlider.value) / 100;
+    });
+    objBounceSlider.addEventListener('input', () => {
+      objBounceGlobal = parseFloat(objBounceSlider.value) / 100;
+    });
+    crosshairCheckbox.addEventListener('change', () => {
+      showCrosshair = crosshairCheckbox.checked;
+    });
+    enableShadowsCheckbox.addEventListener('change', () => {
+      enableShadows = enableShadowsCheckbox.checked;
+    });
+    enableSoftShadowsCheckbox.addEventListener('change', () => {
+      enableSoftShadows = enableSoftShadowsCheckbox.checked;
+    });
+    enableReflectionsCheckbox.addEventListener('change', () => {
+      enableReflections = enableReflectionsCheckbox.checked;
+    });
+    enableSmartReflectionsCheckbox.addEventListener('change', () => {
+      enableSmartReflections = enableSmartReflectionsCheckbox.checked;
+    });
+    enableReflectionBlurCheckbox.addEventListener('change', () => {
+      enableReflectionBlur = enableReflectionBlurCheckbox.checked;
+    });
+    enableReflectionShadowsCheckbox.addEventListener('change', () => {
+      enableReflectionShadows = enableReflectionShadowsCheckbox.checked;
+    });
+    enableDOFCheckbox.addEventListener('change', () => {
+      enableDOF = enableDOFCheckbox.checked;
+    });
+    thirdPersonCheckbox.addEventListener('change', () => {
+      thirdPerson = thirdPersonCheckbox.checked;
+    });
+    handheldCheckbox.addEventListener('change', () => {
+      enableHandheld = handheldCheckbox.checked;
+    });
+
+    // ==== Управление (камера: только углы, позиция = шар) ====
+    const keys = {};
+    window.addEventListener('keydown', (e) => {
+      keys[e.code] = true;
+      window.addEventListener('keyup', (e) => {
+        keys[e.code] = false;
+        if (e.code === 'Space') {
+          if (isGrounded) {
+            playerSphere.vel.y = 5.0;
+            isGrounded = false; // сразу считаем, что в воздухе
+          }
+        }
+      });
+    });
+
+    let camYaw = 180;
+    let camPitch = -5;
+    let viewCamPos = { x: 0, y: 0, z: 0 };
+    let viewCamPosInitialized = false;
+    let yawVel = 0;
+    let pitchVel = 0;
+
+    let handheldYawOffset = 0;
+    let handheldPitchOffset = 0;
+    let handheldYawTarget = 0;
+    let handheldPitchTarget = 0;
+    let handheldTimeToNextTarget = 0;
+
+    let lastTimeMs = 0;
+    let currentFocusDist = 6;
+    let focusInitialized = false;
+    let isGrounded = false;
+
+    // Мышь
+    let mouseDown = false;
+    let lastMouseX = 0;
+    let lastMouseY = 0;
+    canvas.addEventListener('mousedown', (e) => {
+      mouseDown = true;
+      lastMouseX = e.clientX;
+      lastMouseY = e.clientY;
+    });
+    window.addEventListener('mouseup', () => {
+      mouseDown = false;
+    });
+    window.addEventListener('mousemove', (e) => {
+      if (!mouseDown) return;
+      const dx = e.clientX - lastMouseX;
+      const dy = e.clientY - lastMouseY;
+      lastMouseX = e.clientX;
+      lastMouseY = e.clientY;
+      const sens = 0.15;
+      camYaw += dx * sens;
+      camPitch -= dy * sens;
+      if (camPitch > 89) camPitch = 89;
+      if (camPitch < -89) camPitch = -89; // не даём "перевернуть" камеру
+    });
+
+    // ==== Сферы ====
+    const spheres = [];
+    function randColor() {
+      const r = 0.1 + Math.random() * 0.9;
+      const g = 0.1 + Math.random() * 0.9;
+      const b = 0.1 + Math.random() * 0.9;
+      return { r, g, b };
+    }
+
+    for (let i = 0; i < MAX_SPHERES; i++) {
+      const radius = 0.4 + Math.random() * 0.8;
+      const x = (Math.random() - 0.5) * 6.0;
+      const z = -3.0 + (Math.random() - 0.5) * 4.0;
+      const y = -1.0 + radius + Math.random() * 10;
+
+      const mass = radius * radius * radius * 2.0;
+      const restitution = 0.1 + Math.random() * 0.8;
+      const friction = 0.1;
+
+      const reflectivity = 0 + Math.random() * 0.3;
+      const roughness    = 0.2 + Math.random() * 0.8;
+
+      const col = randColor();
+
+      spheres.push({
+        pos: { x, y, z },
+        vel: { x: 0.0, y: 0.0, z: 0.0 },
+        radius,
+        mass,
+        restitution,
+        friction,
+        color: col,
+        reflectivity,
+        roughness
+      });
+    }
+
+    // игрок — первый шар
+    const playerSphere = spheres[PLAYER_INDEX];
+    // ставим его туда, где была стартовая камера
+    playerSphere.pos.x = 0;
+    playerSphere.pos.z = 5;
+    playerSphere.pos.y = -1.0 + playerSphere.radius + 0.3;
+    // чёрный глянец
+    playerSphere.color = { r: 0.0, g: 0.0, b: 0.0 };
+    playerSphere.reflectivity = 1.0;
+    playerSphere.roughness = 0.9;
+
+    const groundY = -1.0;
+
+    // cooldown на ускорение после удара
+    let playerAccelBlockedUntil = 0;
+
+    // ==== Шейдеры (ТВОЙ fsSource, я не меняю его структуру) ====
+    const vsSource = `
+      attribute vec2 aPosition;
+      void main() {
+        gl_Position = vec4(aPosition, 0.0, 1.0);
+      }
+    `;
+
+    const fsSource = `
+      precision highp float;
+
+      #define MAX_SPHERES ${MAX_SPHERES}
+
+      uniform vec2 uResolution;
+      uniform float uTime;
+      uniform float uFov;
+      uniform float uAperture;
+      uniform float uFocusDist;
+      uniform float uShowCrosshair;
+
+      uniform float uEnableShadows;
+      uniform float uEnableSoftShadows;
+      uniform float uEnableReflections;
+      uniform float uEnableSmartReflections;
+      uniform float uEnableReflectionBlur;
+      uniform float uEnableReflectionShadows;
+      uniform float uEnableDOF;
+
+      uniform vec3 uCamPos;
+      uniform float uCamYaw;
+      uniform float uCamPitch;
+
+      uniform int   uSphereCount;
+      uniform vec3  uSphereCenter[MAX_SPHERES];
+      uniform float uSphereRadius[MAX_SPHERES];
+      uniform vec3  uSphereColor[MAX_SPHERES];
+      uniform float uSphereReflectivity[MAX_SPHERES];
+      uniform float uSphereRoughness[MAX_SPHERES];
+
+      float intersectSphere(vec3 ro, vec3 rd, vec3 center, float radius) {
+        vec3 oc = ro - center;
+        float a = dot(rd, rd);
+        float b = 2.0 * dot(oc, rd);
+        float c = dot(oc, oc) - radius * radius;
+        float disc = b*b - 4.0*a*c;
+        if (disc < 0.0) return -1.0;
+        float s = sqrt(disc);
+        float t1 = (-b - s) / (2.0 * a);
+        float t2 = (-b + s) / (2.0 * a);
+        float t = t1;
+        if (t < 0.0) t = t2;
+        if (t < 0.0) return -1.0;
+        return t;
+      }
+
+      float intersectPlane(vec3 ro, vec3 rd, vec3 n, float d) {
+        float denom = dot(rd, n);
+        if (abs(denom) < 1e-4) return -1.0;
+        float t = -(dot(ro, n) + d) / denom;
+        return t > 0.0 ? t : -1.0;
+      }
+
+      struct Hit {
+        float t;
+        vec3 normal;
+        vec3 color;
+        float reflectivity;
+        float roughness;
+      };
+
+      vec3 getSkyColor(vec3 rd) {
+        float t = 0.5 * (rd.y + 1.0);
+        return mix(vec3(0.05, 0.05, 0.08), vec3(0.2, 0.4, 0.7), t);
+      }
+
+      float hash(vec2 p) {
+        return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453123);
+      }
+
+      Hit traceScene(vec3 ro, vec3 rd) {
+        Hit hit;
+        hit.t = -1.0;
+        hit.normal = vec3(0.0);
+        hit.color = vec3(0.0);
+        hit.reflectivity = 0.0;
+        hit.roughness = 0.0;
+
+        // --- СФЕРЫ ---
+        for (int i = 0; i < MAX_SPHERES; i++) {
+          if (i >= uSphereCount) break;
+
+          vec3 center = uSphereCenter[i];
+          float radius = uSphereRadius[i];
+
+          float tSphere = intersectSphere(ro, rd, center, radius);
+          if (tSphere > 0.0 && (hit.t < 0.0 || tSphere < hit.t)) {
+            hit.t = tSphere;
+
+            vec3 pos   = ro + rd * tSphere;
+            vec3 local = pos - center;
+            vec3 nor   = normalize(local);
+
+            vec3 baseCol = uSphereColor[i];
+
+            float refl  = uSphereReflectivity[i];
+            float rough = uSphereRoughness[i];
+
+            hit.normal      = nor;
+            hit.color       = baseCol;
+            hit.reflectivity = refl;
+            hit.roughness    = rough;
+          }
+        }
+
+        // --- ПЛОСКОСТЬ (пол) ---
+        vec3 planeN = vec3(0.0, 1.0, 0.0);
+        float planeD = 1.0;
+        float tPlane = intersectPlane(ro, rd, planeN, planeD);
+        if (tPlane > 0.0) {
+          vec3 pos = ro + rd * tPlane;
+          if (hit.t < 0.0 || tPlane < hit.t) {
+            hit.t = tPlane;
+            hit.normal = planeN;
+
+            float scale = 1.5;
+            float cx = floor(pos.x * scale);
+            float cz = floor(pos.z * scale);
+            float checker = mod(cx + cz, 2.0);
+            float cellColor = mix(0.2, 0.9, checker);
+
+            float dist = length(pos.xz);
+            float fadeStart = 8.0;
+            float fadeEnd   = 25.0;
+            float fade = clamp((dist - fadeStart) / (fadeEnd - fadeStart), 0.0, 1.0);
+            float avgColor = 0.55;
+            float filtered = mix(cellColor, avgColor, fade);
+
+            hit.color = vec3(filtered * 0.9);
+            hit.reflectivity = 0.12;
+            hit.roughness   = 0.2;
+          }
+        }
+
+        return hit;
+      }
+
+      // мягкие / жёсткие тени
+      float softShadow(vec3 pos, vec3 lightPos, float lightRadius) {
+        if (uEnableShadows < 0.5) {
+          return 1.0;
+        }
+
+        // Жёсткая тень от точечного источника
+        if (uEnableSoftShadows < 0.5) {
+          vec3 L = lightPos - pos;
+          float distToLight = length(L);
+          vec3 dir = L / distToLight;
+          vec3 ro = pos + dir * 0.02;
+          vec3 rd = dir;
+
+          float tMin = 1e20;
+          for (int i = 0; i < MAX_SPHERES; i++) {
+            if (i >= uSphereCount) break;
+            float tS = intersectSphere(ro, rd, uSphereCenter[i], uSphereRadius[i]);
+            if (tS > 0.0 && tS < distToLight) {
+              tMin = min(tMin, tS);
+            }
+          }
+          vec3 planeN = vec3(0.0, 1.0, 0.0);
+          float planeD = 1.0;
+          float tP = intersectPlane(ro, rd, planeN, planeD);
+          if (tP > 0.0 && tP < distToLight) tMin = min(tMin, tP);
+
+          return (tMin >= 1e19) ? 1.0 : 0.0;
+        }
+
+        // Мягкие тени от площадного источника
+        float visibility = 0.0;
+        const int SAMPLES = 8;
+
+        for (int i = 0; i < SAMPLES; i++) {
+          float fi = float(i);
+
+          vec2 rnd = vec2(
+            hash(pos.xz + vec2(13.1, 7.7)  * fi + uTime * 0.3),
+            hash(pos.xz + vec2(5.3,  9.2)  * fi + uTime * 0.47)
+          );
+          float r = lightRadius * sqrt(rnd.x);
+          float a = rnd.y * 6.2831853;
+
+          vec3 lp = lightPos + vec3(cos(a) * r, 0.0, sin(a) * r);
+
+          vec3 L = lp - pos;
+          float distToLight = length(L);
+          vec3 dir = L / distToLight;
+
+          vec3 ro = pos + dir * 0.02;
+          vec3 rd = dir;
+
+          float tMin = 1e20;
+
+          for (int i2 = 0; i2 < MAX_SPHERES; i2++) {
+            if (i2 >= uSphereCount) break;
+            float tS = intersectSphere(ro, rd, uSphereCenter[i2], uSphereRadius[i2]);
+            if (tS > 0.0 && tS < distToLight) {
+              tMin = min(tMin, tS);
+            }
+          }
+
+          vec3 planeN = vec3(0.0, 1.0, 0.0);
+          float planeD = 1.0;
+          float tP = intersectPlane(ro, rd, planeN, planeD);
+          if (tP > 0.0 && tP < distToLight) tMin = min(tMin, tP);
+
+          if (tMin >= 1e19) {
+            visibility += 1.0;
+          }
+        }
+
+        return visibility / float(SAMPLES);
+      }
+
+      vec3 shadeHit(vec3 ro, vec3 rd, Hit hit) {
+        vec3 pos = ro + rd * hit.t;
+
+        vec3 lightPos = vec3(-2.0, 4.0, -1.5);
+        float lightRadius = 1.2;
+
+        vec3 L = lightPos - pos;
+        float distToLight = length(L);
+        vec3 lightDir = L / distToLight;
+
+        float diff = max(dot(hit.normal, lightDir), 0.0);
+        float att = 1.0 / (1.0 + 0.1 * distToLight + 0.02 * distToLight * distToLight);
+
+        float shadow = softShadow(pos, lightPos, lightRadius);
+        float ambient = 0.18;
+
+        float lighting = ambient + diff * shadow * 1.4 * att;
+
+        float skyRef = max(0.0, dot(hit.normal, vec3(0.0, 1.0, 0.0)));
+        vec3 skyColor = vec3(0.3, 0.5, 0.8) * skyRef * 0.2;
+
+        return hit.color * lighting + skyColor;
+      }
+
+      vec3 blurredReflection(vec3 origin, vec3 reflDir, Hit baseHit, vec2 uv) {
+        vec3 n = baseHit.normal;
+        float rough = baseHit.roughness;
+
+        vec3 t = normalize(abs(reflDir.y) < 0.99 ? cross(reflDir, vec3(0.0,1.0,0.0))
+                                                : cross(reflDir, vec3(1.0,0.0,0.0)));
+        vec3 b = cross(reflDir, t);
+
+        int samples = (uEnableReflectionBlur > 0.5) ? 2 : 1;
+        vec3 acc = vec3(0.0);
+
+        for (int i = 0; i < 2; i++) {
+          if (i >= samples) break;
+
+          float fi = float(i);
+          float r1 = hash(uv + vec2(fi * 13.1, fi * 7.7) + uTime * 0.1);
+          float r2 = hash(uv + vec2(fi * 5.3,  fi * 9.2) + uTime * 0.13);
+
+          float angle = r1 * 6.2831853;
+          float radius = r2 * rough;
+
+          vec3 offsetDir = normalize(
+            reflDir +
+            (cos(angle) * t + sin(angle) * b) * radius
+          );
+
+          Hit h = traceScene(origin, offsetDir);
+          vec3 col;
+          if (h.t < 0.0) {
+            col = getSkyColor(offsetDir);
+          } else {
+            if (uEnableReflectionShadows > 0.5) {
+              col = shadeHit(origin, offsetDir, h);
+            } else {
+              col = h.color;
+            }
+          }
+
+          acc += col;
+        }
+
+        return acc / float(samples);
+      }
+
+      vec3 renderRay(vec2 uv) {
+        vec3 camBasePos = uCamPos;
+
+        float yawRad   = radians(uCamYaw);
+        float pitchRad = radians(uCamPitch);
+
+        vec3 forward = normalize(vec3(
+          cos(pitchRad) * sin(yawRad),
+          sin(pitchRad),
+          cos(pitchRad) * cos(yawRad)
+        ));
+
+        vec3 right = normalize(vec3(forward.z, 0.0, -forward.x));
+        vec3 up    = normalize(cross(right, forward));
+
+        float fovRad = radians(uFov);
+        float fovScale = tan(fovRad * 0.5);
+        vec3 rdIdeal = normalize(forward + uv.x * fovScale * right + uv.y * fovScale * up);
+
+        vec3 camPos;
+        vec3 rd;
+
+        if (uEnableDOF > 0.5 && uAperture > 0.0001) {
+          vec2 rnd = vec2(
+            hash(uv + vec2(uTime, 1.23)),
+            hash(uv + vec2(4.56, uTime))
+          );
+          float r = sqrt(rnd.x);
+          float theta = rnd.y * 6.2831853;
+          vec2 disk = r * vec2(cos(theta), sin(theta));
+          float lensRadius = uAperture * 0.5;
+          vec3 lensOffset = (right * disk.x + up * disk.y) * lensRadius;
+
+          camPos = camBasePos + lensOffset;
+
+          vec3 focusPoint = camBasePos + rdIdeal * uFocusDist;
+          rd = normalize(focusPoint - camPos);
+        } else {
+          camPos = camBasePos;
+          rd = rdIdeal;
+        }
+
+        Hit hit1 = traceScene(camPos, rd);
+
+        vec3 color;
+
+        if (hit1.t < 0.0) {
+          color = getSkyColor(rd);
+        } else {
+          vec3 baseColor = shadeHit(camPos, rd, hit1);
+
+          if (hit1.reflectivity > 0.01 && uEnableReflections > 0.5) {
+            vec3 reflDir = reflect(rd, hit1.normal);
+            vec3 reflOrigin = camPos + rd * hit1.t + hit1.normal * 0.01;
+
+            vec3 reflColor;
+
+            if (uEnableReflectionBlur > 0.5 && hit1.roughness > 0.02) {
+              reflColor = blurredReflection(reflOrigin, reflDir, hit1, uv);
+            } else {
+              Hit h2 = traceScene(reflOrigin, reflDir);
+              if (h2.t < 0.0) {
+                reflColor = getSkyColor(reflDir);
+              } else {
+                if (uEnableReflectionShadows > 0.5) {
+                  reflColor = shadeHit(reflOrigin, reflDir, h2);
+                } else {
+                  reflColor = h2.color;
+                }
+              }
+            }
+
+            float cosTheta = clamp(dot(-rd, hit1.normal), 0.0, 1.0);
+            float mixFactor;
+
+            if (uEnableSmartReflections > 0.5) {
+              float baseF0 = 0.04;
+              float F0 = mix(baseF0, 1.0, clamp(hit1.reflectivity, 0.0, 1.0));
+              float fresnel = F0 + (1.0 - F0) * pow(1.0 - cosTheta, 5.0);
+              mixFactor = fresnel;
+            } else {
+              mixFactor = clamp(hit1.reflectivity, 0.0, 1.0);
+            }
+
+            float dim = 0.9;
+            mixFactor *= dim;
+
+            color = mix(baseColor, reflColor, mixFactor);
+          } else {
+            color = baseColor;
+          }
+        }
+
+        color = pow(color, vec3(0.4545));
+        return color;
+      }
+
+      void main() {
+        vec2 baseUv = (gl_FragCoord.xy - 0.5 * uResolution) / uResolution.y;
+        baseUv.y = -baseUv.y;
+
+        vec2 offsets[4];
+        offsets[0] = vec2(-0.25, -0.25);
+        offsets[1] = vec2( 0.25, -0.25);
+        offsets[2] = vec2(-0.25,  0.25);
+        offsets[3] = vec2( 0.25,  0.25);
+
+        vec3 col = vec3(0.0);
+        for (int i = 0; i < 4; i++) {
+          vec2 uv = baseUv + offsets[i] / uResolution.y;
+          col += renderRay(uv);
+        }
+        col /= 4.0;
+
+        float inner = 0.004;
+        float outer = 0.015;
+        float dist = length(baseUv);
+        float mask = 1.0 - smoothstep(inner, outer, dist);
+        vec3 chColor = vec3(1.0);
+        float chAlpha = 0.25;
+        col = mix(col, chColor, mask * chAlpha * uShowCrosshair);
+
+        gl_FragColor = vec4(col, 1.0);
+      }
+    `;
+
+    // ==== WebGL setup ====
+    function createShader(gl, type, source) {
+      const shader = gl.createShader(type);
+      gl.shaderSource(shader, source);
+      gl.compileShader(shader);
+      if (!gl.getShaderParameter(shader, gl.COMPILE_STATUS)) {
+        console.error('Ошибка компиляции шейдера:', gl.getShaderInfoLog(shader));
+        gl.deleteShader(shader);
+        return null;
+      }
+      return shader;
+    }
+
+    function createProgram(gl, vsSource, fsSource) {
+      const vs = createShader(gl, gl.VERTEX_SHADER, vsSource);
+      const fs = createShader(gl, gl.FRAGMENT_SHADER, fsSource);
+      if (!vs || !fs) {
+        throw new Error('Не удалось скомпилировать шейдеры');
+      }
+      const program = gl.createProgram();
+      gl.attachShader(program, vs);
+      gl.attachShader(program, fs);
+      gl.linkProgram(program);
+      if (!gl.getProgramParameter(program, gl.LINK_STATUS)) {
+        console.error('Ошибка линковки программы:', gl.getProgramInfoLog(program));
+        gl.deleteProgram(program);
+        return null;
+      }
+      return program;
+    }
+
+    const program = createProgram(gl, vsSource, fsSource);
+    gl.useProgram(program);
+
+    const aPositionLoc   = gl.getAttribLocation(program, 'aPosition');
+    const uResolutionLoc = gl.getUniformLocation(program, 'uResolution');
+    const uTimeLoc       = gl.getUniformLocation(program, 'uTime');
+    const uFovLoc        = gl.getUniformLocation(program, 'uFov');
+    const uApertureLoc   = gl.getUniformLocation(program, 'uAperture');
+    const uFocusDistLoc  = gl.getUniformLocation(program, 'uFocusDist');
+    const uCamPosLoc     = gl.getUniformLocation(program, 'uCamPos');
+    const uCamYawLoc     = gl.getUniformLocation(program, 'uCamYaw');
+    const uCamPitchLoc   = gl.getUniformLocation(program, 'uCamPitch');
+    const uShowCrosshairLoc = gl.getUniformLocation(program, 'uShowCrosshair');
+    const uEnableShadowsLoc = gl.getUniformLocation(program, 'uEnableShadows');
+    const uEnableSoftShadowsLoc = gl.getUniformLocation(program, 'uEnableSoftShadows');
+    const uEnableReflectionsLoc = gl.getUniformLocation(program, 'uEnableReflections');
+    const uEnableSmartReflectionsLoc = gl.getUniformLocation(program, 'uEnableSmartReflections');
+    const uEnableReflectionBlurLoc = gl.getUniformLocation(program, 'uEnableReflectionBlur');
+    const uEnableReflectionShadowsLoc = gl.getUniformLocation(program, 'uEnableReflectionShadows');
+    const uEnableDOFLoc  = gl.getUniformLocation(program, 'uEnableDOF');
+    const uSphereCountLoc  = gl.getUniformLocation(program, 'uSphereCount');
+    const uSphereCenterLoc = gl.getUniformLocation(program, 'uSphereCenter[0]');
+    const uSphereRadiusLoc = gl.getUniformLocation(program, 'uSphereRadius[0]');
+    const uSphereColorLoc  = gl.getUniformLocation(program, 'uSphereColor[0]');
+    const uSphereReflectivityLoc = gl.getUniformLocation(program, 'uSphereReflectivity[0]');
+    const uSphereRoughnessLoc    = gl.getUniformLocation(program, 'uSphereRoughness[0]');
+
+    const vertices = new Float32Array([
+      -1, -1,
+       1, -1,
+      -1,  1,
+      -1,  1,
+       1, -1,
+       1,  1
+    ]);
+
+    const buffer = gl.createBuffer();
+    gl.bindBuffer(gl.ARRAY_BUFFER, buffer);
+    gl.bufferData(gl.ARRAY_BUFFER, vertices, gl.STATIC_DRAW);
+
+    gl.enableVertexAttribArray(aPositionLoc);
+    gl.vertexAttribPointer(aPositionLoc, 2, gl.FLOAT, false, 0, 0);
+
+    function resize() {
+      const ratio = canvas.width / canvas.height;
+      const w = Math.min(window.innerWidth * 0.95, 1000);
+      const h = w / ratio;
+      canvas.style.width = w + 'px';
+      canvas.style.height = h + 'px';
+      gl.viewport(0, 0, canvas.width, canvas.height);
+      gl.uniform2f(uResolutionLoc, canvas.width, canvas.height);
+    }
+    window.addEventListener('resize', resize);
+    resize();
+
+    // ===== JS интерсекты =====
+    function intersectSphereJS(ro, rd, center, radius) {
+      const ocx = ro.x - center.x;
+      const ocy = ro.y - center.y;
+      const ocz = ro.z - center.z;
+      const a = rd.x*rd.x + rd.y*rd.y + rd.z*rd.z;
+      const b = 2 * (ocx*rd.x + ocy*rd.y + ocz*rd.z);
+      const c = ocx*ocx + ocy*ocy + ocz*ocz - radius*radius;
+      const disc = b*b - 4*a*c;
+      if (disc < 0) return -1;
+      const s = Math.sqrt(disc);
+      let t1 = (-b - s) / (2*a);
+      let t2 = (-b + s) / (2*a);
+      let t = t1;
+      if (t < 0) t = t2;
+      if (t < 0) return -1;
+      return t;
+    }
+
+    function intersectPlaneJS(ro, rd, n, d) {
+      const denom = rd.x*n.x + rd.y*n.y + rd.z*n.z;
+      if (Math.abs(denom) < 1e-4) return -1;
+      const dotRoN = ro.x*n.x + ro.y*n.y + ro.z*n.z;
+      const t = -(dotRoN + d) / denom;
+      return t > 0 ? t : -1;
+    }
+
+    let lastPlayerCollisionTime = 0;
+
+    function render(timeMs) {
+      const g = 9.81 * gravityK;
+      const player = playerSphere;
+
+      const time = timeMs * 0.001;
+      let dt = 0;
+      if (lastTimeMs) dt = (timeMs - lastTimeMs) * 0.001;
+      lastTimeMs = timeMs;
+      if (dt > 0.05) dt = 0.05;
+
+      // ==== дрожание камеры (handheld) ====
+      if (enableHandheld) {
+        // скоростной компонент — чем быстрее бежим, тем сильнее трясёт
+        const playerSpeed2D = Math.hypot(player.vel.x, player.vel.z);
+        const moveFactor = Math.min(1, playerSpeed2D / 80.0); // подгони делитель под свои скорости
+
+        // базовая амплитуда дыхания
+        const baseYawAmp   = 1.5;   // градусов
+        const basePitchAmp = 0.8;  // градусов
+
+        // добавка от движения
+        const moveYawAmp   = 1.5 * moveFactor;
+        const movePitchAmp = 1.0 * moveFactor;
+
+        const yawAmp   = baseYawAmp   + moveYawAmp;
+        const pitchAmp = basePitchAmp + movePitchAmp;
+
+        // плавная «восьмёрка» / эллипсы:
+        // несколько синусов с разными фазами и частотами
+        handheldYawOffset =
+          yawAmp * (
+            Math.sin(time * 0.8) * 0.7 +
+            Math.sin(time * 1.7 + 1.3) * 0.3
+          );
+
+        handheldPitchOffset =
+          pitchAmp * (
+            Math.sin(time * 1.1 + 0.4) * 0.6 +
+            Math.sin(time * 0.6 + 2.0) * 0.4
+          );
+      } else {
+        // плавно затухаем к нулю, если галка выключена
+        const decay = Math.max(0, 1 - 5 * dt);
+        handheldYawOffset   *= decay;
+        handheldPitchOffset *= decay;
+      }
+
+      const yawView   = camYaw   + (enableHandheld ? handheldYawOffset   : 0);
+      const pitchView = camPitch + (enableHandheld ? handheldPitchOffset : 0);
+
+      // ==== вход движения для игрока (шар) ====
+      const yawRad = camYaw * Math.PI / 180;
+
+      let dirX = 0;
+      let dirZ = 0;
+      if (keys['KeyW']) { dirX += Math.sin(yawRad); dirZ += Math.cos(yawRad); }
+      if (keys['KeyS']) { dirX -= Math.sin(yawRad); dirZ -= Math.cos(yawRad); }
+      if (keys['KeyA']) { dirX += Math.sin(yawRad - Math.PI / 2); dirZ += Math.cos(yawRad - Math.PI / 2); }
+      if (keys['KeyD']) { dirX += Math.sin(yawRad + Math.PI / 2); dirZ += Math.cos(yawRad + Math.PI / 2); }
+
+      const accel = 16.0;
+      const maxSpeed = 360.0;
+      const damping = 8.0;
+
+      const dirLen = Math.hypot(dirX, dirZ);
+      const canAccelerate = (time - lastPlayerCollisionTime) > 0.1;
+
+      if (dirLen > 0.0001 && dt > 0 && canAccelerate) {
+        const nx = dirX / dirLen;
+        const nz = dirZ / dirLen;
+        player.vel.x += nx * accel * dt;
+        player.vel.z += nz * accel * dt;
+      } else {
+        const speed = Math.hypot(player.vel.x, player.vel.z);
+        if (speed > 0 && dt > 0) {
+          const drop = Math.max(speed - damping * dt, 0) / speed;
+          player.vel.x *= drop;
+          player.vel.z *= drop;
+        }
+      }
+
+      let playerSpeed = Math.hypot(player.vel.x, player.vel.z);
+      if (playerSpeed > maxSpeed) {
+        const s = maxSpeed / playerSpeed;
+        player.vel.x *= s;
+        player.vel.z *= s;
+        playerSpeed = maxSpeed;
+      }
+
+      // ==== физика сфер ====
+      isGrounded = false;
+      for (let i = 0; i < spheres.length; i++) {
+        const s = spheres[i];
+        if (dt > 0) {
+          s.vel.y -= g * dt;
+          s.pos.x += s.vel.x * dt;
+          s.pos.y += s.vel.y * dt;
+          s.pos.z += s.vel.z * dt;
+        }
+
+        const bottom = s.pos.y - s.radius;
+        if (bottom < groundY) {
+          s.pos.y = groundY + s.radius;
+          if (s.vel.y < 0) {
+            s.vel.y = -s.vel.y * floorBounceGlobal * s.restitution * objBounceGlobal;
+          }
+          const sp2 = Math.hypot(s.vel.x, s.vel.z);
+          if (sp2 > 0 && dt > 0) {
+            const friction = s.friction * g;
+            const factor = Math.max(0, 1 - friction * dt);
+            s.vel.x *= factor;
+            s.vel.z *= factor;
+          }
+          if (i === PLAYER_INDEX) {
+            isGrounded = true;
+          }
+        }
+      }
+
+      // столкновения сфер
+      for (let i = 0; i < spheres.length; i++) {
+        for (let j = i + 1; j < spheres.length; j++) {
+          const a = spheres[i];
+          const b = spheres[j];
+          const dx = b.pos.x - a.pos.x;
+          const dy = b.pos.y - a.pos.y;
+          const dz = b.pos.z - a.pos.z;
+          const dist = Math.hypot(dx, dy, dz);
+          const minDist = a.radius + b.radius;
+          if (dist > 1e-4 && dist < minDist) {
+            const nx = dx / dist;
+            const ny = dy / dist;
+            const nz = dz / dist;
+            const penetration = minDist - dist;
+
+            const invA = 1 / a.mass;
+            const invB = 1 / b.mass;
+            const invSum = invA + invB;
+
+            const moveA = penetration * (invA / invSum);
+            const moveB = penetration * (invB / invSum);
+
+            a.pos.x -= nx * moveA;
+            a.pos.y -= ny * moveA;
+            a.pos.z -= nz * moveA;
+
+            b.pos.x += nx * moveB;
+            b.pos.y += ny * moveB;
+            b.pos.z += nz * moveB;
+
+            const rvx = b.vel.x - a.vel.x;
+            const rvy = b.vel.y - a.vel.y;
+            const rvz = b.vel.z - a.vel.z;
+            const relVel = rvx*nx + rvy*ny + rvz*nz;
+            if (relVel < 0) {
+              const e = objBounceGlobal * 0.5 * (a.restitution + b.restitution);
+              const j = -(1 + e) * relVel / invSum;
+              const jx = j * nx;
+              const jy = j * ny;
+              const jz = j * nz;
+              a.vel.x -= jx * invA;
+              a.vel.y -= jy * invA;
+              a.vel.z -= jz * invA;
+              b.vel.x += jx * invB;
+              b.vel.y += jy * invB;
+              b.vel.z += jz * invB;
+
+              if (i === PLAYER_INDEX || j === PLAYER_INDEX) {
+                lastPlayerCollisionTime = time;
+              }
+
+              // const impact = Math.min(1, Math.max(0, -relVel / 20)); // сила удара -> 0..1
+
+              const relSpeed = Math.abs(relVel);
+
+              // приведённая масса (reduced mass) для двух тел
+              const reducedMass = (a.mass * b.mass) / (a.mass + b.mass);
+
+              // грубая "энергия удара"
+              const energy = 0.5 * reducedMass * relSpeed * relSpeed; // чем больше масса и скорость — тем больше
+
+              // нормализация энергии в 0..1 (подбери 50 под свои масштабы)
+              let impact = energy / (energy + 50.0);
+
+              // чуть ограничим, чтобы не ушло в мусор
+              if (impact < 0) impact = 0;
+              if (impact > 1) impact = 1;
+
+              const cx = (a.pos.x + b.pos.x) * 0.5;
+              const cy = (a.pos.y + b.pos.y) * 0.5;
+              const cz = (a.pos.z + b.pos.z) * 0.5;
+
+              const dx = cx - viewCamPos.x;
+              const dy = cy - viewCamPos.y;
+              const dz = cz - viewCamPos.z;
+              const dist = Math.hypot(dx, dy, dz);
+
+              let vol = impact / (1 + dist * 0.4);
+              vol = Math.max(0, Math.min(1, vol));
+
+              if (vol > 0.01) {
+                const snd = dingAudio.cloneNode();
+                snd.volume = vol;
+                snd.play().catch(() => {});
+              }
+            }
+          }
+        }
+      }
+
+      // ==== камера = шар ====
+      if (!thirdPerson) {
+        viewCamPos.x = player.pos.x;
+        viewCamPos.y = player.pos.y;
+        viewCamPos.z = player.pos.z;
+      } else {
+        const pitchRad = camPitch * Math.PI / 180;
+        const yawRad   = camYaw   * Math.PI / 180;
+
+        const fx = Math.cos(pitchRad) * Math.sin(yawRad);
+        const fy = Math.sin(pitchRad);
+        const fz = Math.cos(pitchRad) * Math.cos(yawRad);
+
+        const distBack = player.radius * 3.0 + 2.0;
+        const heightOffset = player.radius * 0.5;
+
+        viewCamPos.x = player.pos.x - fx * distBack;
+        viewCamPos.y = player.pos.y - fy * distBack + heightOffset;
+        viewCamPos.z = player.pos.z - fz * distBack;
+
+        const minCamY = groundY + 0.2;
+        if (viewCamPos.y < minCamY) viewCamPos.y = minCamY;
+      }
+
+      // ==== автофокус из viewCamPos ====
+      const yawRadF   = yawView   * Math.PI / 180;
+      const pitchRadF = pitchView * Math.PI / 180;
+      const fwd = {
+        x: Math.cos(pitchRadF) * Math.sin(yawRadF),
+        y: Math.sin(pitchRadF),
+        z: Math.cos(pitchRadF) * Math.cos(yawRadF),
+      };
+      {
+        const fLen = Math.hypot(fwd.x, fwd.y, fwd.z);
+        fwd.x /= fLen;
+        fwd.y /= fLen;
+        fwd.z /= fLen;
+      }
+
+      const ro = { x: viewCamPos.x, y: viewCamPos.y, z: viewCamPos.z };
+      let tMin = Infinity;
+
+      const maxCount = Math.min(spheres.length, MAX_SPHERES);
+      for (let i = 0; i < maxCount; i++) {
+        // В 1-м лице пропускаем игрока, чтобы не фокуситься на своей же сфере
+        if (!thirdPerson && i === PLAYER_INDEX) continue;
+
+        const s = spheres[i];
+        const tS = intersectSphereJS(ro, fwd, s.pos, s.radius);
+        if (tS > 0 && tS < tMin) tMin = tS;
+      }
+
+      const tP = intersectPlaneJS(ro, fwd, {x:0,y:1,z:0}, 1.0);
+      if (tP > 0 && tP < tMin) tMin = tP;
+
+      let focusDistAuto = isFinite(tMin) ? tMin : 10.0;
+      if (focusDistAuto < 0.5) focusDistAuto = 0.5;
+
+      if (!focusInitialized) {
+        currentFocusDist = focusDistAuto;
+        focusInitialized = true;
+      } else if (dt > 0) {
+        const tau = 0.25;
+        const alpha = 1 - Math.exp(-dt / tau);
+        currentFocusDist += (focusDistAuto - currentFocusDist) * alpha;
+      }
+
+      // 1. Считаем целевую позицию камеры для текущего режима
+
+      // позиция игрока — либо camPos (если ты ещё не перевёл на сферу),
+      // либо playerSphere.pos, если уже сделал "мы = шар".
+      const playerPos = spheres[0].pos;
+
+      // целевая позиция камеры от 1-го лица:
+      const firstPersonCam = { 
+        x: playerPos.x, 
+        y: playerPos.y, 
+        z: playerPos.z 
+      };
+
+      // целевая позиция камеры от 3-го лица:
+      let thirdPersonCam = { x: playerPos.x, y: playerPos.y, z: playerPos.z };
+      if (thirdPerson) {
+        const yawRad   = camYaw * Math.PI / 180;
+        const pitchRad = camPitch * Math.PI / 180;
+
+        // Для орбиты камеры используем только горизонтальное направление
+        const backX = Math.sin(yawRad);
+        const backZ = Math.cos(yawRad);
+
+        const distBack = 3.0;      // твой distBack
+        const heightOffset = 0.8;  // твой heightOffset
+
+        thirdPersonCam.x = playerPos.x - backX * distBack;
+        thirdPersonCam.z = playerPos.z - backZ * distBack;
+        thirdPersonCam.y = playerPos.y + heightOffset;
+
+        // не даём камере опуститься ниже пола
+        const minCamY = groundY + 0.2;
+        if (thirdPersonCam.y < minCamY) thirdPersonCam.y = minCamY;
+        
+        console.log(thirdPersonCam);
+      }
+
+      // целевая точка: либо firstPersonCam, либо thirdPersonCam
+      const targetCamPos = thirdPerson ? thirdPersonCam : firstPersonCam;
+
+      // 2. Гладкий переход к целевой точке
+      // if (!viewCamPosInitialized) {
+      //   viewCamPos.x = targetCamPos.x;
+      //   viewCamPos.y = targetCamPos.y;
+      //   viewCamPos.z = targetCamPos.z;
+      //   viewCamPosInitialized = true;
+      // } else {
+      //   const lerp = 1 - Math.exp(-dt * 10.0); // скорость подбегания камеры
+      //   viewCamPos.x += (targetCamPos.x - viewCamPos.x) * lerp;
+      //   viewCamPos.y += (targetCamPos.y - viewCamPos.y) * lerp;
+      //   viewCamPos.z += (targetCamPos.z - viewCamPos.z) * lerp;
+      // }
+
+      const rotAccel = 480.0;
+      const rotDamp  = 6.0;
+      const maxRotSpeed = 140.0;
+
+      let yawInput = 0;
+      if (keys['ArrowLeft'])  yawInput -= 1;
+      if (keys['ArrowRight']) yawInput += 1;
+
+      let pitchInput = 0;
+      if (keys['ArrowUp'])    pitchInput += 1;
+      if (keys['ArrowDown'])  pitchInput -= 1;
+
+      if (dt > 0) {
+        yawVel   += yawInput   * rotAccel * dt;
+        pitchVel += pitchInput * rotAccel * dt;
+
+        if (yawInput === 0)   yawVel   *= Math.max(0, 1 - rotDamp * dt);
+        if (pitchInput === 0) pitchVel *= Math.max(0, 1 - rotDamp * dt);
+
+        const yawSpeedMag = Math.abs(yawVel);
+        if (yawSpeedMag > maxRotSpeed) yawVel *= maxRotSpeed / yawSpeedMag;
+        const pitchSpeedMag = Math.abs(pitchVel);
+        if (pitchSpeedMag > maxRotSpeed) pitchVel *= maxRotSpeed / pitchSpeedMag;
+
+        // >>> ЭТО ДОБАВИТЬ <<<
+        const eps = 0.001;
+        if (Math.abs(yawVel) < eps) yawVel = 0;
+        if (Math.abs(pitchVel) < eps) pitchVel = 0;
+        // <<<
+
+        camYaw   += yawVel * dt;
+        camPitch += pitchVel * dt;
+      }
+
+      if (camPitch > 89) camPitch = 89;
+      if (camPitch < -89) camPitch = -89;
+
+      // ==== рендер ====
+      gl.viewport(0, 0, canvas.width, canvas.height);
+      gl.clearColor(0, 0, 0, 1);
+      gl.clear(gl.COLOR_BUFFER_BIT);
+
+      gl.uniform1f(uTimeLoc, time);
+      gl.uniform1f(uFovLoc, fov);
+      gl.uniform1f(uApertureLoc, aperture);
+      gl.uniform1f(uFocusDistLoc, currentFocusDist);
+      gl.uniform3f(uCamPosLoc, viewCamPos.x, viewCamPos.y, viewCamPos.z);
+      gl.uniform1f(uCamYawLoc, yawView);
+      gl.uniform1f(uCamPitchLoc, pitchView);
+      gl.uniform1f(uShowCrosshairLoc, showCrosshair ? 1.0 : 0.0);
+      gl.uniform1f(uEnableShadowsLoc, enableShadows ? 1.0 : 0.0);
+      gl.uniform1f(uEnableSoftShadowsLoc, enableSoftShadows ? 1.0 : 0.0);
+      gl.uniform1f(uEnableReflectionsLoc, enableReflections ? 1.0 : 0.0);
+      gl.uniform1f(uEnableSmartReflectionsLoc, enableSmartReflections ? 1.0 : 0.0);
+      gl.uniform1f(uEnableReflectionBlurLoc, enableReflectionBlur ? 1.0 : 0.0);
+      gl.uniform1f(uEnableReflectionShadowsLoc, enableReflectionShadows ? 1.0 : 0.0);
+      gl.uniform1f(uEnableDOFLoc, enableDOF ? 1.0 : 0.0);
+
+      const centers = new Float32Array(MAX_SPHERES * 3);
+      const radii   = new Float32Array(MAX_SPHERES);
+      const colors  = new Float32Array(MAX_SPHERES * 3);
+      const refls   = new Float32Array(MAX_SPHERES);
+      const roughs  = new Float32Array(MAX_SPHERES);
+
+      let outIndex = 0;
+      for (let i = 0; i < spheres.length; i++) {
+        // в 1-м лице не рисуем игрока (чёрный шар), в 3-м рисуем
+        if (!thirdPerson && i === PLAYER_INDEX) continue;
+
+        const s = spheres[i];
+        centers[outIndex*3 + 0] = s.pos.x;
+        centers[outIndex*3 + 1] = s.pos.y;
+        centers[outIndex*3 + 2] = s.pos.z;
+        radii[outIndex] = s.radius;
+        colors[outIndex*3 + 0] = s.color.r;
+        colors[outIndex*3 + 1] = s.color.g;
+        colors[outIndex*3 + 2] = s.color.b;
+        refls[outIndex]  = s.reflectivity;
+        roughs[outIndex] = s.roughness;
+        outIndex++;
+      }
+
+      gl.uniform1i(uSphereCountLoc, outIndex);
+      gl.uniform3fv(uSphereCenterLoc, centers);
+      gl.uniform1fv(uSphereRadiusLoc, radii);
+      gl.uniform3fv(uSphereColorLoc, colors);
+      gl.uniform1fv(uSphereReflectivityLoc, refls);
+      gl.uniform1fv(uSphereRoughnessLoc, roughs);
+
+      gl.drawArrays(gl.TRIANGLES, 0, 6);
+
+      requestAnimationFrame(render);
+    }
+
+    requestAnimationFrame(render);
+  </script>
+</body>
+</html>

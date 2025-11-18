@@ -1,0 +1,484 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8" />
+  <title>Минимальный WebGL Ray Tracing + DOF</title>
+  <style>
+    body {
+      margin: 0;
+      background: #000;
+      display: flex;
+      flex-direction: column;
+      justify-content: center;
+      align-items: center;
+      height: 100vh;
+      font-family: sans-serif;
+      color: #fff;
+    }
+    canvas {
+      border-radius: 10px;
+      max-width: 100%;
+      height: auto;
+    }
+    #controls {
+      margin-top: 12px;
+      background: rgba(10,10,10,0.8);
+      padding: 10px 14px;
+      border-radius: 10px;
+      display: flex;
+      gap: 16px;
+      font-size: 12px;
+    }
+    #controls label {
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+      white-space: nowrap;
+    }
+    #controls input[type="range"] {
+      width: 160px;
+    }
+  </style>
+</head>
+<body>
+  <canvas id="glcanvas" width="900" height="500"></canvas>
+
+  <div id="controls">
+    <label>
+      Фокусное расстояние (FOV)
+      <input type="range" id="fov" min="25" max="100" value="60" />
+    </label>
+    <label>
+      Размер диафрагмы (апертура)
+      <input type="range" id="aperture" min="0" max="100" value="15" />
+    </label>
+    <label>
+      Дистанция фокуса
+      <input type="range" id="focusDist" min="2" max="15" value="6" />
+    </label>
+  </div>
+
+  <script>
+    const canvas = document.getElementById('glcanvas');
+    const gl = canvas.getContext('webgl');
+    if (!gl) {
+      alert('WebGL не завезли. Браузер – мусорное ведро.');
+    }
+
+    // Слайдеры
+    const fovSlider = document.getElementById('fov');
+    const apertureSlider = document.getElementById('aperture');
+    const focusSlider = document.getElementById('focusDist');
+
+    let fov = parseFloat(fovSlider.value);           // градусы
+    let aperture = (parseFloat(apertureSlider.value) / 100) * 0.4; // 0..0.4
+    let focusDist = parseFloat(focusSlider.value);   // юниты сцены
+
+    fovSlider.addEventListener('input', () => {
+      fov = parseFloat(fovSlider.value);
+    });
+    apertureSlider.addEventListener('input', () => {
+      aperture = (parseFloat(apertureSlider.value) / 100) * 0.4;
+    });
+    focusSlider.addEventListener('input', () => {
+      focusDist = parseFloat(focusSlider.value);
+    });
+
+    // Вершинный шейдер
+    const vsSource = `
+      attribute vec2 aPosition;
+      void main() {
+        gl_Position = vec4(aPosition, 0.0, 1.0);
+      }
+    `;
+
+    // Фрагментный шейдер: трассировка + отражения + DOF + Fresnel
+    const fsSource = `
+      precision highp float;
+
+      uniform vec2 uResolution;
+      uniform float uTime;
+      uniform float uFov;        // в градусах
+      uniform float uAperture;   // размер диафрагмы (радиус линзы ~ uAperture*0.5)
+      uniform float uFocusDist;  // дистанция фокуса
+
+      vec3 rotateY(vec3 p, float a) {
+        float c = cos(a);
+        float s = sin(a);
+        return vec3(
+          c * p.x + s * p.z,
+          p.y,
+          -s * p.x + c * p.z
+        );
+      }
+
+      float intersectSphere(vec3 ro, vec3 rd, vec3 center, float radius) {
+        vec3 oc = ro - center;
+        float a = dot(rd, rd);
+        float b = 2.0 * dot(oc, rd);
+        float c = dot(oc, oc) - radius * radius;
+        float disc = b*b - 4.0*a*c;
+        if (disc < 0.0) return -1.0;
+        float s = sqrt(disc);
+        float t1 = (-b - s) / (2.0 * a);
+        float t2 = (-b + s) / (2.0 * a);
+        float t = t1;
+        if (t < 0.0) t = t2;
+        if (t < 0.0) return -1.0;
+        return t;
+      }
+
+      float intersectPlane(vec3 ro, vec3 rd, vec3 n, float d) {
+        float denom = dot(rd, n);
+        if (abs(denom) < 1e-4) return -1.0;
+        float t = -(dot(ro, n) + d) / denom;
+        return t > 0.0 ? t : -1.0;
+      }
+
+      struct Hit {
+        float t;
+        vec3 normal;
+        vec3 color;
+        float reflectivity;
+        float roughness;
+      };
+
+      vec3 getSkyColor(vec3 rd) {
+        float t = 0.5 * (rd.y + 1.0);
+        return mix(vec3(0.05, 0.05, 0.08), vec3(0.2, 0.4, 0.7), t);
+      }
+
+      float hash(vec2 p) {
+        return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453123);
+      }
+
+      Hit traceScene(vec3 ro, vec3 rd) {
+        Hit hit;
+        hit.t = -1.0;
+        hit.normal = vec3(0.0);
+        hit.color = vec3(0.0);
+        hit.reflectivity = 0.0;
+        hit.roughness = 0.0;
+
+        // --- Сфера 1 ---
+        vec3 sphereCenter1 = vec3(0.0, 0.0, -4.0);
+        float sphereRadius1 = 1.0;
+        float tSphere1 = intersectSphere(ro, rd, sphereCenter1, sphereRadius1);
+        if (tSphere1 > 0.0) {
+          hit.t = tSphere1;
+          vec3 pos = ro + rd * tSphere1;
+          hit.normal = normalize(pos - sphereCenter1);
+          hit.color = vec3(0.9, 0.4, 0.2);
+          hit.reflectivity = 0.6;
+          hit.roughness   = 0.18;
+        }
+
+        // --- Сфера 2 ---
+        vec3 sphereCenter2 = vec3(1.8, -0.2, -3.0);
+        float sphereRadius2 = 0.6;
+        float tSphere2 = intersectSphere(ro, rd, sphereCenter2, sphereRadius2);
+        if (tSphere2 > 0.0 && (hit.t < 0.0 || tSphere2 < hit.t)) {
+          hit.t = tSphere2;
+          vec3 pos = ro + rd * tSphere2;
+          hit.normal = normalize(pos - sphereCenter2);
+          hit.color = vec3(0.2, 0.7, 1.0);
+          hit.reflectivity = 0.7;
+          hit.roughness   = 0.2;
+        }
+
+        // --- Плоскость (пол) ---
+        vec3 planeN = vec3(0.0, 1.0, 0.0);
+        float planeD = 1.0;
+        float tPlane = intersectPlane(ro, rd, planeN, planeD);
+        if (tPlane > 0.0) {
+          vec3 pos = ro + rd * tPlane;
+          if (hit.t < 0.0 || tPlane < hit.t) {
+            hit.t = tPlane;
+            hit.normal = planeN;
+
+            float scale = 1.5;
+            float cx = floor(pos.x * scale);
+            float cz = floor(pos.z * scale);
+            float checker = mod(cx + cz, 2.0);
+            float cellColor = mix(0.2, 0.9, checker);
+
+            float dist = length(pos.xz);
+            float fadeStart = 8.0;
+            float fadeEnd   = 25.0;
+            float fade = clamp((dist - fadeStart) / (fadeEnd - fadeStart), 0.0, 1.0);
+            float avgColor = 0.55;
+            float filtered = mix(cellColor, avgColor, fade);
+
+            hit.color = vec3(filtered * 0.9);
+            hit.reflectivity = 0.30;
+            hit.roughness   = 0.06;
+          }
+        }
+
+        return hit;
+      }
+
+      float inShadow(vec3 pos, vec3 lightDir) {
+        vec3 ro = pos + lightDir * 0.01;
+        vec3 rd = lightDir;
+
+        vec3 sphereCenter1 = vec3(0.0, 0.0, -4.0);
+        float sphereRadius1 = 1.0;
+        float tSphere1 = intersectSphere(ro, rd, sphereCenter1, sphereRadius1);
+
+        vec3 sphereCenter2 = vec3(1.8, -0.2, -3.0);
+        float sphereRadius2 = 0.6;
+        float tSphere2 = intersectSphere(ro, rd, sphereCenter2, sphereRadius2);
+
+        vec3 planeN = vec3(0.0, 1.0, 0.0);
+        float planeD = 1.0;
+        float tPlane = intersectPlane(ro, rd, planeN, planeD);
+
+        float tMin = 1e20;
+        if (tSphere1 > 0.0) tMin = min(tMin, tSphere1);
+        if (tSphere2 > 0.0) tMin = min(tMin, tSphere2);
+        if (tPlane  > 0.0) tMin = min(tMin, tPlane);
+
+        return tMin < 1e20 ? 1.0 : 0.0;
+      }
+
+      vec3 shadeHit(vec3 ro, vec3 rd, Hit hit) {
+        vec3 pos = ro + rd * hit.t;
+        vec3 lightDir = normalize(vec3(0.7, 1.0, 0.3));
+
+        float shadow = inShadow(pos, lightDir);
+        float diff = max(dot(hit.normal, lightDir), 0.0);
+        float ambient = 0.15;
+
+        float lighting = ambient + (1.0 - shadow) * diff * 0.9;
+
+        float skyRef = max(0.0, dot(hit.normal, vec3(0.0, 1.0, 0.0)));
+        vec3 skyColor = vec3(0.3, 0.5, 0.8) * skyRef * 0.2;
+
+        return hit.color * lighting + skyColor;
+      }
+
+      vec3 blurredReflection(vec3 origin, vec3 reflDir, Hit baseHit, vec2 uv) {
+        vec3 n = baseHit.normal;
+        float rough = baseHit.roughness;
+
+        vec3 t = normalize(abs(reflDir.y) < 0.99 ? cross(reflDir, vec3(0.0,1.0,0.0))
+                                                 : cross(reflDir, vec3(1.0,0.0,0.0)));
+        vec3 b = cross(reflDir, t);
+
+        vec3 acc = vec3(0.0);
+        const int SAMPLE_COUNT = 4;
+
+        for (int i = 0; i < SAMPLE_COUNT; i++) {
+          float fi = float(i);
+          float r1 = hash(uv + vec2(fi * 13.1, fi * 7.7) + uTime * 0.1);
+          float r2 = hash(uv + vec2(fi * 5.3, fi * 9.2) + uTime * 0.13);
+
+          float angle = r1 * 6.2831853;
+          float radius = r2 * rough;
+
+          vec3 offsetDir = normalize(
+            reflDir +
+            (cos(angle) * t + sin(angle) * b) * radius
+          );
+
+          Hit h = traceScene(origin, offsetDir);
+          vec3 col;
+          if (h.t < 0.0) {
+            col = getSkyColor(offsetDir);
+          } else {
+            col = shadeHit(origin, offsetDir, h);
+          }
+
+          acc += col;
+        }
+
+        return acc / float(SAMPLE_COUNT);
+      }
+
+      vec3 renderRay(vec2 uv) {
+        float angle = uTime * 0.5;
+
+        // базовая позиция камеры
+        vec3 camBasePos = vec3(0.0, 0.3, 5.0);
+        camBasePos = rotateY(camBasePos, angle);
+
+        vec3 target = vec3(0.0, -0.2, -4.0);
+        vec3 forward = normalize(target - camBasePos);
+        vec3 right = normalize(vec3(forward.z, 0.0, -forward.x));
+        vec3 up = normalize(cross(right, forward));
+
+        // FOV -> масштаб лучей
+        float fovRad = radians(uFov);
+        float fovScale = tan(fovRad * 0.5);
+        vec3 rdIdeal = normalize(forward + uv.x * fovScale * right + uv.y * fovScale * up);
+
+        // DOF: сэмплим точку на линзе
+        vec2 rnd = vec2(
+          hash(uv + vec2(uTime, 1.23)),
+          hash(uv + vec2(4.56, uTime))
+        );
+        float r = sqrt(rnd.x);
+        float theta = rnd.y * 6.2831853;
+        vec2 disk = r * vec2(cos(theta), sin(theta));
+        float lensRadius = uAperture * 0.5;
+        vec3 lensOffset = (right * disk.x + up * disk.y) * lensRadius;
+
+        vec3 camPos = camBasePos + lensOffset;
+
+        // точка фокуса (на идеальном луче)
+        vec3 focusPoint = camBasePos + rdIdeal * uFocusDist;
+
+        vec3 rd = normalize(focusPoint - camPos);
+
+        Hit hit1 = traceScene(camPos, rd);
+
+        vec3 color;
+
+        if (hit1.t < 0.0) {
+          color = getSkyColor(rd);
+        } else {
+          vec3 baseColor = shadeHit(camPos, rd, hit1);
+
+          if (hit1.reflectivity > 0.01) {
+            vec3 reflDir = reflect(rd, hit1.normal);
+            vec3 reflOrigin = camPos + rd * hit1.t + hit1.normal * 0.01;
+
+            vec3 reflColor;
+            if (hit1.roughness < 0.005) {
+              Hit h2 = traceScene(reflOrigin, reflDir);
+              if (h2.t < 0.0) reflColor = getSkyColor(reflDir);
+              else            reflColor = shadeHit(reflOrigin, reflDir, h2);
+            } else {
+              reflColor = blurredReflection(reflOrigin, reflDir, hit1, uv);
+            }
+
+            // Fresnel по Шлику
+            float cosTheta = clamp(dot(-rd, hit1.normal), 0.0, 1.0);
+            float F0 = hit1.reflectivity;
+            float fresnel = F0 + (1.0 - F0) * pow(1.0 - cosTheta, 5.0);
+
+            float dim = 0.7;
+            float mixFactor = fresnel * dim;
+
+            color = mix(baseColor, reflColor, mixFactor);
+          } else {
+            color = baseColor;
+          }
+        }
+
+        color = pow(color, vec3(0.4545));
+        return color;
+      }
+
+      void main() {
+        vec2 baseUv = (gl_FragCoord.xy - 0.5 * uResolution) / uResolution.y;
+        baseUv.y = -baseUv.y;
+
+        vec2 offsets[4];
+        offsets[0] = vec2(-0.25, -0.25);
+        offsets[1] = vec2( 0.25, -0.25);
+        offsets[2] = vec2(-0.25,  0.25);
+        offsets[3] = vec2( 0.25,  0.25);
+
+        vec3 col = vec3(0.0);
+        for (int i = 0; i < 4; i++) {
+          vec2 uv = baseUv + offsets[i] / uResolution.y;
+          col += renderRay(uv);
+        }
+        col /= 4.0;
+
+        gl_FragColor = vec4(col, 1.0);
+      }
+    `;
+
+    function createShader(gl, type, source) {
+      const shader = gl.createShader(type);
+      gl.shaderSource(shader, source);
+      gl.compileShader(shader);
+      if (!gl.getShaderParameter(shader, gl.COMPILE_STATUS)) {
+        console.error('Ошибка компиляции шейдера:', gl.getShaderInfoLog(shader));
+        gl.deleteShader(shader);
+        return null;
+      }
+      return shader;
+    }
+
+    function createProgram(gl, vsSource, fsSource) {
+      const vs = createShader(gl, gl.VERTEX_SHADER, vsSource);
+      const fs = createShader(gl, gl.FRAGMENT_SHADER, fsSource);
+      if (!vs || !fs) {
+        throw new Error('Не удалось скомпилировать шейдеры');
+      }
+      const program = gl.createProgram();
+      gl.attachShader(program, vs);
+      gl.attachShader(program, fs);
+      gl.linkProgram(program);
+      if (!gl.getProgramParameter(program, gl.LINK_STATUS)) {
+        console.error('Ошибка линковки программы:', gl.getProgramInfoLog(program));
+        gl.deleteProgram(program);
+        return null;
+      }
+      return program;
+    }
+
+    const program = createProgram(gl, vsSource, fsSource);
+    gl.useProgram(program);
+
+    const aPositionLoc = gl.getAttribLocation(program, 'aPosition');
+    const uResolutionLoc = gl.getUniformLocation(program, 'uResolution');
+    const uTimeLoc = gl.getUniformLocation(program, 'uTime');
+    const uFovLoc = gl.getUniformLocation(program, 'uFov');
+    const uApertureLoc = gl.getUniformLocation(program, 'uAperture');
+    const uFocusDistLoc = gl.getUniformLocation(program, 'uFocusDist');
+
+    const vertices = new Float32Array([
+      -1, -1,
+       1, -1,
+      -1,  1,
+      -1,  1,
+       1, -1,
+       1,  1
+    ]);
+
+    const buffer = gl.createBuffer();
+    gl.bindBuffer(gl.ARRAY_BUFFER, buffer);
+    gl.bufferData(gl.ARRAY_BUFFER, vertices, gl.STATIC_DRAW);
+
+    gl.enableVertexAttribArray(aPositionLoc);
+    gl.vertexAttribPointer(aPositionLoc, 2, gl.FLOAT, false, 0, 0);
+
+    function resize() {
+      const ratio = canvas.width / canvas.height;
+      const w = Math.min(window.innerWidth * 0.95, 1000);
+      const h = w / ratio;
+      canvas.style.width = w + 'px';
+      canvas.style.height = h + 'px';
+      // можно добавить hiDPI, но ты уже игрался, оставлю так
+      gl.viewport(0, 0, canvas.width, canvas.height);
+      gl.uniform2f(uResolutionLoc, canvas.width, canvas.height);
+    }
+    window.addEventListener('resize', resize);
+    resize();
+
+    function render(timeMs) {
+      const time = timeMs * 0.001;
+
+      gl.viewport(0, 0, canvas.width, canvas.height);
+      gl.clearColor(0, 0, 0, 1);
+      gl.clear(gl.COLOR_BUFFER_BIT);
+
+      gl.uniform1f(uTimeLoc, time);
+      gl.uniform1f(uFovLoc, fov);
+      gl.uniform1f(uApertureLoc, aperture);
+      gl.uniform1f(uFocusDistLoc, focusDist);
+
+      gl.drawArrays(gl.TRIANGLES, 0, 6);
+
+      requestAnimationFrame(render);
+    }
+
+    requestAnimationFrame(render);
+  </script>
+</body>
+</html>
